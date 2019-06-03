@@ -222,7 +222,7 @@ export class ScopedGhostService {
     for (const path of paths) {
       const normalizedPath = this.normalizeFolderName(path)
       let currentFiles = await this.dbDriver.directoryListing(normalizedPath)
-      let newFiles = await this.diskDriver.directoryListing(normalizedPath)
+      let newFiles = await this.diskDriver.directoryListing(normalizedPath, undefined, true)
 
       if (path === './') {
         currentFiles = currentFiles.filter(x => !x.includes('/'))
@@ -245,7 +245,7 @@ export class ScopedGhostService {
   }
 
   public async exportToDirectory(directory: string, exludes?: string | string[]): Promise<string[]> {
-    const allFiles = await this.directoryListing('./', '*.*', exludes)
+    const allFiles = await this.directoryListing('./', '*.*', exludes, true)
 
     for (const file of allFiles.filter(x => x !== 'revisions.json')) {
       const content = await this.primaryDriver.readFile(this.normalizeFileName('./', file))
@@ -358,6 +358,13 @@ export class ScopedGhostService {
     await this._invalidateFile(fileName)
   }
 
+  async renameFile(rootFolder: string, fromName: string, toName: string): Promise<void> {
+    const fromPath = this.normalizeFileName(rootFolder, fromName)
+    const toPath = this.normalizeFileName(rootFolder, toName)
+
+    await this.primaryDriver.moveFile(fromPath, toPath)
+  }
+
   async deleteFolder(folder: string): Promise<void> {
     if (this.isDirectoryGlob) {
       throw new Error(`Ghost can't read or write under this scope`)
@@ -370,12 +377,18 @@ export class ScopedGhostService {
   async directoryListing(
     rootFolder: string,
     fileEndingPattern: string = '*.*',
-    exludes?: string | string[]
+    excludes?: string | string[],
+    includeDotFiles?: boolean
   ): Promise<string[]> {
     try {
-      const files = await this.primaryDriver.directoryListing(this.normalizeFolderName(rootFolder), exludes)
+      const files = await this.primaryDriver.directoryListing(
+        this.normalizeFolderName(rootFolder),
+        excludes,
+        includeDotFiles
+      )
+
       return (files || []).filter(
-        minimatch.filter(fileEndingPattern, { matchBase: true, nocase: true, noglobstar: false })
+        minimatch.filter(fileEndingPattern, { matchBase: true, nocase: true, noglobstar: false, dot: includeDotFiles })
       )
     } catch (err) {
       if (err && err.message && err.message.includes('ENOENT')) {
