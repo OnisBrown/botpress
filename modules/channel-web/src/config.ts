@@ -51,4 +51,29 @@ export interface Config {
     enabled: boolean
     description: string
   }
+  /**
+   * The number of messages that are displayed in the chat history
+   * @default 20
+   */
+  maxMessagesHistory?: number
+  /**
+   * Security configurations
+   */
+  security: {
+    /**
+     * Weather or not to escape plain html payload
+     * @default false
+     */
+    escapeHTML: boolean
+  }
+  /**
+   * The duration of the authentication session when a user authenticate through this channel.
+   * @default 24h
+   */
+  chatUserAuthDuration: string
+
+  /**
+   * Path to an additional stylesheet. It will be applied on top of the default style
+   */
+  extraStylesheet: string
 }

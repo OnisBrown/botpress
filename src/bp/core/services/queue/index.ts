@@ -20,13 +20,14 @@ export interface JobWrapper {
   retries: number
 }
 
-export type QueueConsummer = ((message: IO.Event) => Promise<void>)
+export type QueueConsumer = (message: IO.Event) => Promise<void>
 
 export interface Queue {
   isEmpty(): boolean
+  isEmptyForJob(job: Job): boolean
   enqueue(job: Job, retries: number, isPriority: boolean): Promise<void>
   dequeue(): Promise<JobWrapper | undefined>
   cancelAll(job: Job): Promise<void>
   peek(job: Job): Promise<JobWrapper | undefined>
-  subscribe(fn: QueueConsummer): void
+  subscribe(fn: QueueConsumer): void
 }

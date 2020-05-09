@@ -1,66 +1,86 @@
+import * as sdk from 'botpress/sdk'
+import { validate } from 'joi'
 import _ from 'lodash'
 
-import * as parsers from './parsers.js'
+import { QnaEntry, QnaItem } from './qna'
+import Storage from './storage'
+import { QnaItemArraySchema, QnaItemCmsArraySchema } from './validation'
 
-const ANSWERS_SPLIT_CHAR = '†'
+const debug = DEBUG('qna:import')
 
-export const importQuestions = async (questions, params) => {
-  const { storage, config, format = 'json', statusCallback, uploadStatusId } = params
+type ContentData = Pick<sdk.ContentElement, 'id' | 'contentType' | 'formData'>
 
-  statusCallback(uploadStatusId, 'Calculating diff with existing questions')
+interface ImportData {
+  questions?: QnaItem[]
+  content?: ContentData[]
+}
 
-  const existingQuestions = (await storage.fetchAllQuestions()).map(item =>
-    JSON.stringify(_.omit(item.data, 'enabled'))
-  )
-
-  const hasCategory = storage.hasCategories()
-  const parsedQuestions =
-    typeof questions === 'string' ? parsers[`${format}Parse`](questions, { hasCategory }) : questions
-  const questionsToSave = parsedQuestions.filter(item => !existingQuestions.includes(JSON.stringify(item)))
-
-  if (config.qnaMakerApiKey) {
-    return storage.insert(questionsToSave.map(question => ({ ...question, enabled: true })))
+export const prepareImport = async (parsedJson: any): Promise<ImportData> => {
+  try {
+    const result = (await validate(parsedJson, QnaItemCmsArraySchema)) as {
+      contentElements: ContentData[]
+      qnas: QnaItem[]
+    }
+    return { questions: result.qnas, content: result.contentElements }
+  } catch (err) {
+    debug(`New format doesn't match provided file %o`, { err })
   }
 
+  try {
+    const result = (await validate(parsedJson, QnaItemArraySchema)) as QnaItem[]
+    return { questions: result, content: undefined }
+  } catch (err) {
+    debug(`Old format doesn't match provided file %o`, { err })
+  }
+
+  return {}
+}
+
+export const importQuestions = async (data: ImportData, storage, bp, statusCallback, uploadStatusId) => {
+  statusCallback(uploadStatusId, 'Calculating diff with existing questions')
+
+  const { questions, content } = data
+  if (!questions) {
+    return
+  }
+
+  if (content) {
+    for (const element of content) {
+      await bp.cms.createOrUpdateContentElement(storage.botId, element.contentType, element.formData, element.id)
+    }
+  }
+
+  const existingQuestionItems = (await (storage as Storage).fetchQNAs()).map(item => item.id)
+  const itemsToSave = questions.filter(item => !existingQuestionItems.includes(item.id))
+  const entriesToSave = itemsToSave.map(q => q.data)
+
   let questionsSavedCount = 0
-  return Promise.each(questionsToSave, async question => {
-    const answers = question['answer'].split(ANSWERS_SPLIT_CHAR)
-    await storage.insert({ ...question, answers, enabled: true })
+  return Promise.each(entriesToSave, async (question: QnaEntry & { category?: string }) => {
+    const item = { ...question, enabled: true }
+
+    // Support for previous QnA
+    if (item.category) {
+      item.contexts = [item.category]
+      delete item.category
+    }
+
+    await (storage as Storage).insert(item)
     questionsSavedCount += 1
-    statusCallback(uploadStatusId, `Saved ${questionsSavedCount}/${questionsToSave.length} questions`)
+    statusCallback(
+      uploadStatusId,
+      `Saved ${questionsSavedCount}/${entriesToSave.length} question${entriesToSave.length === 1 ? '' : 's'}`
+    )
   })
 }
 
-export const prepareExport = async (storage, { flat = false } = {}) => {
-  const qnas = await storage.fetchAllQuestions()
+export const prepareExport = async (storage: Storage, bp: typeof sdk) => {
+  const qnas = await storage.fetchQNAs()
+  const contentElementIds = await storage.getAllContentElementIds()
 
-  return _.flatMap(qnas, question => {
-    const { data } = question
-    const { questions, action, redirectNode, redirectFlow, category, answers, answer: textAnswer } = data
-
-    // FIXME: Remove v11.2 answer support
-    let answer = answers.join(ANSWERS_SPLIT_CHAR) || textAnswer // textAnswer allow to support v11.2 answer format
-    let answer2 = undefined
-
-    // FIXME: Refactor these answer, answer2 fieds for something more meaningful like a 'redirect' field.
-    // redirect dont need text so answer is overriden with the redirect flow
-    if (action === 'redirect') {
-      answer = redirectFlow
-      if (redirectNode) {
-        answer += '#' + redirectNode
-      }
-      // text_redirect will display a text before redirecting to the desired flow
-    } else if (action === 'text_redirect') {
-      answer2 = redirectFlow
-      if (redirectNode) {
-        answer2 += '#' + redirectNode
-      }
-    }
-    const categoryWrapper = storage.getCategories() ? { category } : {}
-
-    if (!flat) {
-      return { questions, action, answer, answer2, ...categoryWrapper }
-    }
-    return questions.map(question => ({ question, action, answer, answer2, ...categoryWrapper }))
+  const contentElements = await Promise.mapSeries(contentElementIds, async id => {
+    const data = await bp.cms.getContentElement(storage.botId, id.replace('#!', ''))
+    return _.pick(data, ['id', 'contentType', 'formData', 'previews'])
   })
+
+  return JSON.stringify({ qnas, contentElements }, undefined, 2)
 }

@@ -1,11 +1,11 @@
 ---
 id: pipelines
-title: Bot Pipeline
+title: Bot Pipelines
 ---
 
 ## Overview
 
-Bot pipelines are built on top of the multi-bot capability of Botpress. They allow teams to work on bots with multiple **stages** the same way others would work on software products. Different versions of a bot can run and co-exist on different stages. In software development, each team has its own way of working with pipelines and reacting to events along the pipeline, Botpress pipelines let you do the same.
+**Bot Pipelines** (not to be confused with Development Pipelines) are built on top of the multi-bot capability of Botpress. They allow teams to work on bots with multiple **stages** the same way others would work on software products. Different versions of a bot can run and co-exist on different stages. In software development, each team has its own way of working with pipelines and reacting to events along the pipeline, Botpress pipelines let you do the same.
 
 Although a typical pipeline would have 3 stages (e.g: _Development_, _Staging_ and _Production_) where a bot goes through all of them. Botpress lets you define your own stages and customize how they interact.
 
@@ -31,7 +31,7 @@ Properties are self explanatory except action which is defined. In a pipeline de
 
 ### Stage Actions
 
-A stage action defines how the pipeline system behaves when a bot is set for promotion (i.e go from one stage to another). Currently 2 actions are available `promote_move` which simply moves the bot from current to next stage and `promote_copy` which creates an exact copy of the bot before being promoted to next stage. The latter is usefull when you want keep a work in progress (i.e Dev stage) version of your bot and send versions along the pipeline.
+A stage action defines how the pipeline system behaves when a bot is set for promotion (i.e go from one stage to another). Currently 2 actions are available `promote_move` which simply moves the bot from current to next stage and `promote_copy` which creates an exact copy of the bot before being promoted to next stage. The latter is useful when you want keep a work in progress (i.e Dev stage) version of your bot and send versions along the pipeline.
 
 ### Bot Pipeline Status
 
@@ -46,18 +46,18 @@ Each bot now defines a `pipeline_status` object in its `bot.config.json` file. T
     "current_stage": {
       "id": "dev", // id of the current stage
       "promoted_on": "2019-04-03T01:08:46.999Z", // date the bot has moved to this stage
-      "promoted_by": "user@botpress.io" //email of the user who changed the stage of the bot
+      "promoted_by": "user@botpress.com" //email of the user who changed the stage of the bot
     },
     "stage_request": {
       "id": "staging", //id of the desired stage
       "requested_on": "2019-04-04T13:16:32.107Z",
-      "requested_by": "user2@botpress.io" //email of the user who asked for a stage change
+      "requested_by": "user2@botpress.com" //email of the user who asked for a stage change
     }
   }
 }
 ```
 
-At the moment, only the current_stage will be interresting for you. We will learn more on `stage_request` in the [available hooks section](#available-hooks)
+At the moment, only the current_stage will be interesting for you. We will learn more on `stage_request` in the [available hooks section](#available-hooks)
 
 ## Usage
 

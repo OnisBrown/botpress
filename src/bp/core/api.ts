@@ -3,6 +3,7 @@ import { WellKnownFlags } from 'core/sdk/enums'
 import { NextFunction, Request, Response } from 'express'
 import { inject, injectable } from 'inversify'
 import Knex from 'knex'
+import _ from 'lodash'
 import { Memoize } from 'lodash-decorators'
 import MLToolkit from 'ml/toolkit'
 
@@ -10,9 +11,10 @@ import { container } from './app.inversify'
 import { ConfigProvider } from './config/config-loader'
 import Database from './database'
 import { LoggerProvider } from './logger'
+import { getMessageSignature } from './misc/security'
 import { renderRecursive } from './misc/templating'
 import { ModuleLoader } from './module-loader'
-import { SessionRepository, UserRepository } from './repositories'
+import { EventRepository, SessionRepository, UserRepository } from './repositories'
 import { Event, RealTimePayload } from './sdk/impl'
 import HTTPServer from './server'
 import { GhostService } from './services'
@@ -20,13 +22,15 @@ import { BotService } from './services/bot-service'
 import { CMSService } from './services/cms'
 import { DialogEngine } from './services/dialog/dialog-engine'
 import { SessionIdFactory } from './services/dialog/session/id-factory'
-import { ScopedGhostService } from './services/ghost/service'
 import { HookService } from './services/hook/hook-service'
+import { JobService } from './services/job-service'
 import { KeyValueStore } from './services/kvs'
 import MediaService from './services/media'
 import { EventEngine } from './services/middleware/event-engine'
+import { StateManager } from './services/middleware/state-manager'
 import { NotificationsService } from './services/notification/service'
 import RealtimeService from './services/realtime'
+import { WorkspaceService } from './services/workspace-service'
 import { TYPES } from './types'
 
 const http = (httpServer: HTTPServer) => (identity: string): typeof sdk.http => {
@@ -42,61 +46,49 @@ const http = (httpServer: HTTPServer) => (identity: string): typeof sdk.http => 
       return httpServer.createRouterForBot(routerName, identity, options || defaultRouterOptions)
     },
     deleteRouterForBot: httpServer.deleteRouterForBot.bind(httpServer),
-    async getAxiosConfigForBot(botId: string, options?: sdk.AxiosOptions): Promise<any> {
-      return httpServer.getAxiosConfigForBot(botId, options)
-    },
-    extractExternalToken(req: Request, res: Response, next: NextFunction): Promise<void> {
-      return httpServer.extractExternalToken(req, res, next)
-    },
-    decodeExternalToken(token: string): Promise<any> {
-      return httpServer.decodeExternalToken(token)
-    }
+    getAxiosConfigForBot: httpServer.getAxiosConfigForBot.bind(httpServer),
+    extractExternalToken: httpServer.extractExternalToken.bind(httpServer),
+    decodeExternalToken: httpServer.decodeExternalToken.bind(httpServer),
+    needPermission: httpServer.needPermission.bind(httpServer),
+    hasPermission: httpServer.hasPermission.bind(httpServer)
   }
 }
 
-const event = (eventEngine: EventEngine): typeof sdk.events => {
+const event = (eventEngine: EventEngine, eventRepo: EventRepository): typeof sdk.events => {
   return {
     registerMiddleware(middleware: sdk.IO.MiddlewareDefinition) {
       eventEngine.register(middleware)
     },
     removeMiddleware: eventEngine.removeMiddleware.bind(eventEngine),
-    sendEvent(event: sdk.IO.Event): void {
-      eventEngine.sendEvent(event)
-    },
-    replyToEvent(eventDestination: sdk.IO.EventDestination, payloads: any[], incomingEventId?: string): void {
-      eventEngine.replyToEvent(eventDestination, payloads, incomingEventId)
-    }
+    sendEvent: eventEngine.sendEvent.bind(eventEngine),
+    replyToEvent: eventEngine.replyToEvent.bind(eventEngine),
+    isIncomingQueueEmpty: eventEngine.isIncomingQueueEmpty.bind(eventEngine),
+    findEvents: eventRepo.findEvents.bind(eventRepo),
+    updateEvent: eventRepo.updateEvent.bind(eventRepo),
+    saveUserFeedback: eventRepo.saveUserFeedback.bind(eventRepo)
   }
 }
 
-const dialog = (dialogEngine: DialogEngine, sessionRepo: SessionRepository): typeof sdk.dialog => {
+const dialog = (
+  dialogEngine: DialogEngine,
+  stateManager: StateManager,
+  moduleLoader: ModuleLoader
+): typeof sdk.dialog => {
   return {
-    createId(eventDestination: sdk.IO.EventDestination) {
-      return SessionIdFactory.createIdFromEvent(eventDestination)
-    },
-    async processEvent(sessionId: string, event: sdk.IO.IncomingEvent): Promise<sdk.IO.IncomingEvent> {
-      return dialogEngine.processEvent(sessionId, event)
-    },
-    async deleteSession(userId: string): Promise<void> {
-      await sessionRepo.delete(userId)
-    },
-    async jumpTo(sessionId: string, event: any, flowName: string, nodeName?: string): Promise<void> {
-      await dialogEngine.jumpTo(sessionId, event, flowName, nodeName)
-    }
+    createId: SessionIdFactory.createIdFromEvent.bind(SessionIdFactory),
+    processEvent: dialogEngine.processEvent.bind(dialogEngine),
+    deleteSession: stateManager.deleteDialogSession.bind(stateManager),
+    jumpTo: dialogEngine.jumpTo.bind(dialogEngine),
+    getConditions: moduleLoader.getDialogConditions.bind(moduleLoader)
   }
 }
 
-const config = (moduleLoader: ModuleLoader, configProfider: ConfigProvider): typeof sdk.config => {
+const config = (moduleLoader: ModuleLoader, configProvider: ConfigProvider): typeof sdk.config => {
   return {
-    getModuleConfig(moduleId: string): Promise<any> {
-      return moduleLoader.configReader.getGlobal(moduleId)
-    },
-    getModuleConfigForBot(moduleId: string, botId: string): Promise<any> {
-      return moduleLoader.configReader.getForBot(moduleId, botId)
-    },
-    getBotpressConfig(): Promise<any> {
-      return configProfider.getBotpressConfig()
-    }
+    getModuleConfig: moduleLoader.configReader.getGlobal.bind(moduleLoader.configReader),
+    getModuleConfigForBot: moduleLoader.configReader.getForBot.bind(moduleLoader.configReader),
+    getBotpressConfig: configProvider.getBotpressConfig.bind(configProvider),
+    mergeBotConfig: configProvider.mergeBotConfig.bind(configProvider)
   }
 }
 
@@ -111,9 +103,8 @@ const bots = (botService: BotService): typeof sdk.bots => {
     exportBot(botId: string): Promise<Buffer> {
       return botService.exportBot(botId)
     },
-    importBot(botId: string, archive: Buffer, allowOverwrite?: boolean): Promise<void> {
-      return botService.importBot(botId, archive, allowOverwrite)
-    }
+    importBot: botService.importBot.bind(botService),
+    getBotTemplate: botService.getBotTemplate.bind(botService)
   }
 }
 
@@ -121,6 +112,7 @@ const users = (userRepo: UserRepository): typeof sdk.users => {
   return {
     getOrCreateUser: userRepo.getOrCreate.bind(userRepo),
     updateAttributes: userRepo.updateAttributes.bind(userRepo),
+    getAttributes: userRepo.getAttributes.bind(userRepo),
     setAttributes: userRepo.setAttributes.bind(userRepo),
     getAllUsers: userRepo.getAllUsers.bind(userRepo),
     getUserCount: userRepo.getUserCount.bind(userRepo)
@@ -129,30 +121,16 @@ const users = (userRepo: UserRepository): typeof sdk.users => {
 
 const kvs = (kvs: KeyValueStore): typeof sdk.kvs => {
   return {
-    async get(botId: string, key: string, path?: string): Promise<any> {
-      return kvs.get(botId, key, path)
-    },
-    async set(botId: string, key: string, value: string, path?: string) {
-      return kvs.set(botId, key, value, path)
-    },
-    async getStorageWithExpiry(botId, key): Promise<any> {
-      return kvs.getStorageWithExpiry(botId, key)
-    },
-    async setStorageWithExpiry(botId: string, key: string, value, expiryInMs?: string): Promise<void> {
-      return kvs.setStorageWithExpiry(botId, key, value, expiryInMs)
-    },
-    async removeStorageKeysStartingWith(key): Promise<void> {
-      return kvs.removeStorageKeysStartingWith(key)
-    },
-    getConversationStorageKey(sessionId, variable): string {
-      return kvs.getConversationStorageKey(sessionId, variable)
-    },
-    getUserStorageKey(userId, variable): string {
-      return kvs.getUserStorageKey(userId, variable)
-    },
-    getGlobalStorageKey(variable): string {
-      return kvs.getGlobalStorageKey(variable)
-    }
+    forBot: kvs.forBot.bind(kvs),
+    global: kvs.global.bind(kvs),
+    get: kvs.get.bind(kvs),
+    set: kvs.set.bind(kvs),
+    getStorageWithExpiry: kvs.getStorageWithExpiry.bind(kvs),
+    setStorageWithExpiry: kvs.setStorageWithExpiry.bind(kvs),
+    removeStorageKeysStartingWith: kvs.removeStorageKeysStartingWith.bind(kvs),
+    getConversationStorageKey: kvs.getConversationStorageKey.bind(kvs),
+    getUserStorageKey: kvs.getUserStorageKey.bind(kvs),
+    getGlobalStorageKey: kvs.getGlobalStorageKey.bind(kvs)
   }
 }
 
@@ -164,15 +142,18 @@ const notifications = (notificationService: NotificationsService): typeof sdk.no
   }
 }
 
+const security = (): typeof sdk.security => {
+  return {
+    getMessageSignature: getMessageSignature
+  }
+}
+
 const ghost = (ghostService: GhostService): typeof sdk.ghost => {
   return {
-    forBot(botId: string): ScopedGhostService {
-      return ghostService.forBot(botId)
-    },
-
-    forGlobal(): ScopedGhostService {
-      return ghostService.global()
-    }
+    forBot: ghostService.forBot.bind(ghostService),
+    forBots: ghostService.bots.bind(ghostService),
+    forGlobal: ghostService.global.bind(ghostService),
+    forRoot: ghostService.root.bind(ghostService)
   }
 }
 
@@ -204,6 +185,23 @@ const cms = (cmsService: CMSService, mediaService: MediaService): typeof sdk.cms
   }
 }
 
+const workspaces = (workspaceService: WorkspaceService): typeof sdk.workspaces => {
+  return {
+    getBotWorkspaceId: workspaceService.getBotWorkspaceId.bind(workspaceService),
+    getWorkspaceRollout: workspaceService.getWorkspaceRollout.bind(workspaceService),
+    addUserToWorkspace: workspaceService.addUserToWorkspace.bind(workspaceService),
+    consumeInviteCode: workspaceService.consumeInviteCode.bind(workspaceService)
+  }
+}
+
+const distributed = (jobService: JobService): typeof sdk.distributed => {
+  return {
+    broadcast: jobService.broadcast.bind(jobService),
+    acquireLock: jobService.acquireLock.bind(jobService),
+    clearLock: jobService.clearLock.bind(jobService)
+  }
+}
+
 const experimental = (hookService: HookService): typeof sdk.experimental => {
   return {
     disableHook: hookService.disableHook.bind(hookService),
@@ -229,7 +227,7 @@ export class BotpressAPIProvider {
   dialog: typeof sdk.dialog
   config: typeof sdk.config
   realtime: RealTimeAPI
-  database: Knex
+  database: Knex & sdk.KnexExtension
   users: typeof sdk.users
   kvs: typeof sdk.kvs
   notifications: typeof sdk.notifications
@@ -238,6 +236,9 @@ export class BotpressAPIProvider {
   cms: typeof sdk.cms
   mlToolkit: typeof sdk.MLToolkit
   experimental: typeof sdk.experimental
+  security: typeof sdk.security
+  workspaces: typeof sdk.workspaces
+  distributed: typeof sdk.distributed
 
   constructor(
     @inject(TYPES.DialogEngine) dialogEngine: DialogEngine,
@@ -248,20 +249,23 @@ export class BotpressAPIProvider {
     @inject(TYPES.HTTPServer) httpServer: HTTPServer,
     @inject(TYPES.UserRepository) userRepo: UserRepository,
     @inject(TYPES.RealtimeService) realtimeService: RealtimeService,
-    @inject(TYPES.SessionRepository) sessionRepo: SessionRepository,
     @inject(TYPES.KeyValueStore) keyValueStore: KeyValueStore,
     @inject(TYPES.NotificationsService) notificationService: NotificationsService,
     @inject(TYPES.BotService) botService: BotService,
     @inject(TYPES.GhostService) ghostService: GhostService,
     @inject(TYPES.CMSService) cmsService: CMSService,
-    @inject(TYPES.ConfigProvider) configProfider: ConfigProvider,
+    @inject(TYPES.ConfigProvider) configProvider: ConfigProvider,
     @inject(TYPES.MediaService) mediaService: MediaService,
-    @inject(TYPES.HookService) hookService: HookService
+    @inject(TYPES.HookService) hookService: HookService,
+    @inject(TYPES.EventRepository) eventRepo: EventRepository,
+    @inject(TYPES.WorkspaceService) workspaceService: WorkspaceService,
+    @inject(TYPES.JobService) jobService: JobService,
+    @inject(TYPES.StateManager) stateManager: StateManager
   ) {
     this.http = http(httpServer)
-    this.events = event(eventEngine)
-    this.dialog = dialog(dialogEngine, sessionRepo)
-    this.config = config(moduleLoader, configProfider)
+    this.events = event(eventEngine, eventRepo)
+    this.dialog = dialog(dialogEngine, stateManager, moduleLoader)
+    this.config = config(moduleLoader, configProvider)
     this.realtime = new RealTimeAPI(realtimeService)
     this.database = db.knex
     this.users = users(userRepo)
@@ -272,6 +276,9 @@ export class BotpressAPIProvider {
     this.cms = cms(cmsService, mediaService)
     this.mlToolkit = MLToolkit
     this.experimental = experimental(hookService)
+    this.security = security()
+    this.workspaces = workspaces(workspaceService)
+    this.distributed = distributed(jobService)
   }
 
   @Memoize()
@@ -300,7 +307,10 @@ export class BotpressAPIProvider {
       ghost: this.ghost,
       bots: this.bots,
       cms: this.cms,
-      experimental: this.experimental
+      security: this.security,
+      experimental: this.experimental,
+      workspaces: this.workspaces,
+      distributed: this.distributed
     }
   }
 }

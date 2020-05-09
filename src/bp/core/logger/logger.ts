@@ -1,7 +1,12 @@
-import { AxiosError, AxiosRequestConfig } from 'axios'
-import { Logger, LoggerEntry, LoggerLevel, LogLevel } from 'botpress/sdk'
+import { AxiosError } from 'axios'
+import { Logger, LoggerEntry, LoggerLevel, LoggerListener, LogLevel } from 'botpress/sdk'
 import chalk from 'chalk'
+import { Metric } from 'common/monitoring'
+import { IDisposable } from 'core/misc/disposable'
+import { BotService } from 'core/services/bot-service'
 import { incrementMetric } from 'core/services/monitoring'
+import { InvalidParameterError } from 'errors'
+import { EventEmitter2 } from 'eventemitter2'
 import { inject, injectable } from 'inversify'
 import _ from 'lodash'
 import moment from 'moment'
@@ -15,6 +20,20 @@ import { LoggerDbPersister, LoggerFilePersister } from '.'
 
 export type LoggerProvider = (module: string) => Promise<Logger>
 
+function serializeArgs(args: any): string {
+  if (_.isArray(args)) {
+    return args.map(arg => serializeArgs(arg)).join(', ')
+  } else if (_.isObject(args)) {
+    return util.inspect(args, false, 2, true)
+  } else if (_.isString(args)) {
+    return args.trim()
+  } else if (args && args.toString) {
+    return args.toString()
+  } else {
+    return ''
+  }
+}
+
 @injectable()
 // Suggestion: Would be best to have a CompositeLogger that separates the Console and DB loggers
 export class PersistedConsoleLogger implements Logger {
@@ -23,6 +42,25 @@ export class PersistedConsoleLogger implements Logger {
   public readonly displayLevel: number
   private currentMessageLevel: LogLevel | undefined
   private willPersistMessage: boolean = true
+  private emitLogStream = true
+  private serverHostname: string = ''
+
+  private static LogStreamEmitter: EventEmitter2 = new EventEmitter2({
+    delimiter: '::',
+    maxListeners: 1000,
+    verboseMemoryLeak: true,
+    wildcard: true
+  })
+
+  public static listenForAllLogs(fn: LoggerListener, botId: string = '*'): IDisposable {
+    if (!_.isFunction(fn)) {
+      throw new InvalidParameterError('"fn" listener must be a callback function')
+    }
+
+    const namespace = `logs::${botId}`
+    this.LogStreamEmitter.on(namespace, fn)
+    return { dispose: () => this.LogStreamEmitter.off(namespace, fn) }
+  }
 
   constructor(
     @inject(TYPES.Logger_Name) private name: string,
@@ -30,6 +68,7 @@ export class PersistedConsoleLogger implements Logger {
     @inject(TYPES.LoggerFilePersister) private loggerFilePersister: LoggerFilePersister
   ) {
     this.displayLevel = process.VERBOSITY_LEVEL
+    this.serverHostname = os.hostname()
   }
 
   forBot(botId: string): this {
@@ -52,55 +91,78 @@ export class PersistedConsoleLogger implements Logger {
     return this
   }
 
+  noEmit(): this {
+    this.emitLogStream = false
+    return this
+  }
+
   colors = {
     [LoggerLevel.Info]: 'green',
     [LoggerLevel.Warn]: 'yellow',
     [LoggerLevel.Error]: 'red',
+    [LoggerLevel.Critical]: 'red',
     [LoggerLevel.Debug]: 'blue'
   }
 
   private print(level: LoggerLevel, message: string, metadata: any) {
+    if (typeof message !== 'string') {
+      metadata = message
+      message = '(object)'
+    }
+
+    let forceIndentMessage = false
     if (this.attachedError) {
       try {
         const asAxios = this.attachedError as AxiosError
         if (asAxios.response && asAxios.config) {
-          message += os.EOL + `HTTP (${asAxios.config.method}) URL ${asAxios.config.url}`
+          forceIndentMessage = true
+          message += '\n' + `HTTP (${asAxios.config.method}) URL ${asAxios.config.url}`
           if (asAxios.config.params && Object.keys(asAxios.config.params).length > 0) {
-            message += os.EOL + `Params (${JSON.stringify(asAxios.config.params)})`
+            message += '\n' + `Params (${JSON.stringify(asAxios.config.params)})`
           }
           if (asAxios.response && asAxios.response.data) {
             let errMsg = ''
             if (typeof asAxios.response.data === 'string') {
               errMsg = asAxios.response.data
             } else if (typeof asAxios.response.data === 'object') {
-              errMsg =
-                _.get(asAxios.response.data, 'error.message') ||
-                _.get(asAxios.response.data, 'error') ||
-                _.get(asAxios.response.data, 'message') ||
-                _.get(asAxios.response.data, 'reason')
+              errMsg = _.at(asAxios.response.data, [
+                'error.message',
+                'error.description',
+                'error.reason',
+                'error_message',
+                'error_description',
+                'error_reason',
+                'error',
+                'description',
+                'message',
+                'reason'
+              ])
+                .filter(Boolean)
+                .join('. ')
             }
             if (typeof errMsg === 'string' && errMsg.length) {
               errMsg = errMsg.trim()
               if (errMsg.length >= 100) {
                 errMsg = errMsg.substr(0, 100) + ' (...)'
               }
-              message += os.EOL + `Received "${errMsg}"`
+              message += '\n' + `Received "${errMsg}"`
             }
           }
-          message += os.EOL + this.attachedError.message
+          message += '\n' + this.attachedError.message
         } else {
           message += ` [${this.attachedError.name}, ${this.attachedError.message}]`
         }
       } catch (err) {}
     }
 
-    const serializedMetadata = metadata ? ' | ' + util.inspect(metadata, false, 2, true) : ''
-    const timeFormat = 'HH:mm:ss.SSS'
+    const serializedMetadata = metadata ? serializeArgs(metadata) : ''
+    const timeFormat = 'L HH:mm:ss.SSS'
     const time = moment().format(timeFormat)
 
     const displayName = process.env.INDENT_LOGS ? this.name.substr(0, 15).padEnd(15, ' ') : this.name
     const newLineIndent = chalk.dim(' '.repeat(`${timeFormat} ${displayName}`.length)) + ' '
-    let indentedMessage = level === LoggerLevel.Error ? message : message.replace(/\r\n|\n/g, os.EOL + newLineIndent)
+    let indentedMessage =
+      level === LoggerLevel.Error && !forceIndentMessage ? message : message.replace(/\r\n|\n/g, os.EOL + newLineIndent)
 
     if (
       this.attachedError &&
@@ -114,11 +176,21 @@ export class PersistedConsoleLogger implements Logger {
 
     const entry: LoggerEntry = {
       botId: this.botId,
+      hostname: this.serverHostname,
       level: level.toString(),
       scope: displayName,
       message: stripAnsi(indentedMessage),
       metadata: stripAnsi(serializedMetadata),
-      timestamp: moment().toISOString()
+      timestamp: new Date()
+    }
+
+    if (this.emitLogStream) {
+      PersistedConsoleLogger.LogStreamEmitter.emit(
+        `logs::${this.botId || '*'}`,
+        level,
+        indentedMessage,
+        serializedMetadata
+      ) // Args => level, message, args
     }
 
     if (this.willPersistMessage && level !== LoggerLevel.Debug) {
@@ -139,11 +211,12 @@ export class PersistedConsoleLogger implements Logger {
     this.currentMessageLevel = undefined
     this.botId = undefined
     this.attachedError = undefined
+    this.emitLogStream = true
   }
 
   debug(message: string, metadata?: any): void {
     if (this.currentMessageLevel === undefined) {
-      this.currentMessageLevel = LogLevel.DEV
+      this.currentMessageLevel = LogLevel.DEBUG
     }
 
     this.print(LoggerLevel.Debug, message, metadata)
@@ -162,7 +235,11 @@ export class PersistedConsoleLogger implements Logger {
       this.currentMessageLevel = LogLevel.PRODUCTION
     }
 
-    incrementMetric('warnings.count')
+    if (this.botId) {
+      BotService.incrementBotStats(this.botId, 'warning')
+    }
+
+    incrementMetric(Metric.Warnings)
     this.print(LoggerLevel.Warn, message, metadata)
   }
 
@@ -171,7 +248,24 @@ export class PersistedConsoleLogger implements Logger {
       this.currentMessageLevel = LogLevel.PRODUCTION
     }
 
-    incrementMetric('errors.count')
+    if (this.botId) {
+      BotService.incrementBotStats(this.botId, 'error')
+    }
+
+    incrementMetric(Metric.Errors)
     this.print(LoggerLevel.Error, message, metadata)
+  }
+
+  critical(message: string, metadata?: any): void {
+    if (this.currentMessageLevel === undefined) {
+      this.currentMessageLevel = LogLevel.PRODUCTION
+    }
+
+    if (this.botId) {
+      BotService.incrementBotStats(this.botId, 'critical')
+    }
+
+    incrementMetric(Metric.Criticals)
+    this.print(LoggerLevel.Critical, message, metadata)
   }
 }

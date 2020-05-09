@@ -1,46 +1,28 @@
-import { Logger } from 'botpress/sdk'
-import { defaultAdminRole, defaultRoles, defaultUserRole } from 'common/default-roles'
-import { ConfigProvider } from 'core/config/config-loader'
-import { AuthRole, AuthUser, BasicAuthUser, ExternalAuthUser, Pipeline, Workspace } from 'core/misc/interfaces'
-import { Statistics } from 'core/stats'
+import { AddWorkspaceUserOptions, Logger, RolloutStrategy, WorkspaceRollout } from 'botpress/sdk'
+import { CHAT_USER_ROLE, defaultPipelines, defaultWorkspace } from 'common/defaults'
+import { AuthRole, CreateWorkspace, Pipeline, Workspace, WorkspaceUser } from 'common/typings'
+import { WorkspaceInviteCode, WorkspaceInviteCodesRepository } from 'core/repositories'
+import { StrategyUsersRepository } from 'core/repositories/strategy_users'
+import { WorkspaceUserAttributes, WorkspaceUsersRepository } from 'core/repositories/workspace_users'
+import { BadRequestError, ConflictError, NotFoundError } from 'core/routers/errors'
 import { inject, injectable, tagged } from 'inversify'
 import _ from 'lodash'
+import nanoid from 'nanoid/generate'
 
 import { TYPES } from '../types'
 
+import { InvalidOperationError } from './auth/errors'
 import { GhostService } from './ghost/service'
 
-const DEFAULT_USER_ATTRIBUTES = [
-  'email',
-  'company',
-  'created_on',
-  'firstname',
-  'fullName',
-  'last_ip',
-  'last_logon',
-  'lastname',
-  'location',
-  'role'
+export const ROLLOUT_STRATEGIES: RolloutStrategy[] = [
+  'anonymous',
+  'anonymous-invite',
+  'authenticated',
+  'authenticated-invite',
+  'authorized'
 ]
 
-const DEFAULT_PIPELINE: Pipeline = [
-  {
-    id: 'prod',
-    label: 'Production',
-    action: 'promote_copy'
-  }
-]
-
-const DEFAULT_WORKSPACE: Workspace = {
-  name: 'Default',
-  userSeq: 0,
-  users: [],
-  bots: [],
-  roles: defaultRoles,
-  defaultRole: defaultUserRole,
-  adminRole: defaultAdminRole,
-  pipeline: [...DEFAULT_PIPELINE]
-}
+const UNLIMITED = -1
 
 @injectable()
 export class WorkspaceService {
@@ -49,156 +31,299 @@ export class WorkspaceService {
     @tagged('name', 'WorkspaceService')
     private logger: Logger,
     @inject(TYPES.GhostService) private ghost: GhostService,
-    @inject(TYPES.ConfigProvider) private configProvider: ConfigProvider,
-    @inject(TYPES.Statistics) private stats: Statistics
+    @inject(TYPES.WorkspaceUsersRepository) private workspaceRepo: WorkspaceUsersRepository,
+    @inject(TYPES.StrategyUsersRepository) private usersRepo: StrategyUsersRepository,
+    @inject(TYPES.WorkspaceInviteCodesRepository) private inviteCodesRepo: WorkspaceInviteCodesRepository
   ) {}
 
   async initialize(): Promise<void> {
-    await this.getWorkspace().catch(async () => {
-      await this.save({ ...DEFAULT_WORKSPACE })
+    await this.getWorkspaces().catch(async () => {
+      await this.save([defaultWorkspace])
       this.logger.info('Created workspace')
     })
   }
 
-  async getWorkspace(): Promise<Workspace> {
+  async getWorkspaces(): Promise<Workspace[]> {
     const workspaces = await this.ghost.global().readFileAsObject<Workspace[]>('/', `workspaces.json`)
     if (!workspaces || !workspaces.length) {
       throw new Error('No workspace found in workspaces.json')
     }
 
-    return workspaces[0]
+    return workspaces
   }
 
-  async save(workspace: Workspace) {
-    await this.ghost.global().upsertFile('/', `workspaces.json`, JSON.stringify([workspace], undefined, 2))
+  async save(workspaces: Workspace[]): Promise<void> {
+    return this.ghost.global().upsertFile('/', `workspaces.json`, JSON.stringify(workspaces, undefined, 2))
   }
 
-  async addBotRef(botId: string): Promise<void> {
-    const workspace = await this.getWorkspace()
+  async mergeWorkspaceConfig(workspaceId: string, partialData: Partial<Workspace>) {
+    const workspaces = await this.getWorkspaces()
+    if (!workspaces.find(x => x.id === workspaceId)) {
+      throw new NotFoundError(`Workspace doesn't exist`)
+    }
+
+    return this.save(workspaces.map(wks => (wks.id === workspaceId ? { ...wks, ...partialData } : wks)))
+  }
+
+  async addBotRef(botId: string, workspaceId: string): Promise<void> {
+    const workspaces = await this.getWorkspaces()
+    const workspace = workspaces.find(x => x.id === workspaceId)
+
+    if (!workspace) {
+      throw new Error(`Specified workspace "${workspaceId}" doesn't exist`)
+    }
+
     workspace.bots.push(botId)
-    await this.save(workspace)
+    return this.save(workspaces)
   }
 
   async deleteBotRef(botId: any): Promise<void> {
-    const workspace = await this.getWorkspace()
+    const workspaces = await this.getWorkspaces()
+
+    const botWorkspaceId = await this.getBotWorkspaceId(botId)
+    const workspace = workspaces.find(x => x.id === botWorkspaceId)
+
+    if (!workspace) {
+      throw new Error(`Specified workspace "${botWorkspaceId}" doesn't exist`)
+    }
+
     const index = workspace.bots.findIndex(x => x === botId)
+    if (index === -1) {
+      return
+    }
     workspace.bots.splice(index, 1)
-    await this.save(workspace)
+    return this.save(workspaces)
   }
 
-  async getBotRefs(): Promise<string[]> {
-    const workspace = await this.getWorkspace()
-    return workspace.bots
-  }
-
-  async listUsers(selectFields?: Array<keyof AuthUser>): Promise<Partial<AuthUser[]>> {
-    const workspace = await this.getWorkspace()
-    if (!selectFields) {
-      return workspace.users
+  async getBotRefs(workspaceId?: string): Promise<string[]> {
+    if (!workspaceId) {
+      const workspace = await this.getWorkspaces()
+      return _.flatten(workspace.map(x => x.bots))
     } else {
-      return _.map(workspace.users, x => _.pick(x, selectFields))
+      const workspace = await this.findWorkspace(workspaceId)
+      return (workspace && workspace.bots) || []
     }
   }
 
-  async assertUserExists(email: string): Promise<void> {
-    const user = await this.findUser({ email })
-    if (!user) {
-      throw new Error(`User "${email}" is not a part of the workspace`)
+  async findWorkspace(workspaceId: string): Promise<Workspace> {
+    const workspaces = await this.getWorkspaces()
+
+    const workspace = workspaces.find(x => x.id === workspaceId)
+    if (!workspace) {
+      throw new NotFoundError(`Unknown workspace`)
     }
+
+    return workspace
   }
 
-  async findUser(where: {}, selectFields?: Array<keyof AuthUser> | '*'): Promise<Partial<AuthUser> | undefined> {
-    const workspace = await this.getWorkspace()
-    const user = _.head(_.filter<AuthUser>(workspace.users, where))
-
-    if (!user) {
-      return undefined
-    }
-
-    if (selectFields === '*') {
-      return user
-    }
-
-    return _.pick<AuthUser>(user, ...(selectFields || DEFAULT_USER_ATTRIBUTES)) as Partial<AuthUser>
+  async findWorkspaceName(workspaceId: string): Promise<string> {
+    const all = await this.getWorkspaces()
+    const workspace = all.find(x => x.id === workspaceId)
+    return (workspace && workspace.name) || workspaceId
   }
 
-  async findRole(roleId: string): Promise<AuthRole> {
-    const workspace = await this.getWorkspace()
-    const role = workspace.roles.find(r => r.id === roleId)
+  async createWorkspace(workspace: CreateWorkspace): Promise<void> {
+    const workspaces = await this.getWorkspaces()
+    if (workspaces.find(x => x.id === workspace.id)) {
+      throw new ConflictError(`A workspace with that id "${workspace.id}" already exists`)
+    }
+
+    if (!defaultPipelines[workspace.pipelineId]) {
+      throw new InvalidOperationError(`Invalid pipeline`)
+    }
+
+    const newWorkspace = {
+      ...defaultWorkspace,
+      ..._.pick(workspace, ['id', 'name', 'description', 'audience']),
+      pipeline: defaultPipelines[workspace.pipelineId]
+    }
+
+    workspaces.push(newWorkspace)
+    return this.save(workspaces)
+  }
+
+  async deleteWorkspace(workspaceId: string): Promise<void> {
+    const workspaces = await this.getWorkspaces()
+    if (!workspaces.find(x => x.id === workspaceId)) {
+      throw new NotFoundError(`Workspace doesn't exist`)
+    }
+
+    return this.save(workspaces.filter(x => x.id !== workspaceId))
+  }
+
+  async addUserToWorkspace(email: string, strategy: string, workspaceId: string, options?: AddWorkspaceUserOptions) {
+    if (!(await this.usersRepo.findUser(email, strategy))) {
+      throw new Error(`Specified user doesn't exist`)
+    }
+
+    const workspace = await this.findWorkspace(workspaceId)
+    let role = workspace.defaultRole
+
+    if (options) {
+      if (options.role) {
+        role = options.role
+      } else if (options.asAdmin) {
+        role = workspace.adminRole
+      } else if (options.asChatUser) {
+        role = CHAT_USER_ROLE.id
+      }
+    }
+
+    await this.workspaceRepo.createEntry({ email, strategy, workspace: workspaceId, role })
+  }
+
+  async getWorkspaceRollout(workspaceId: string): Promise<WorkspaceRollout> {
+    const { rolloutStrategy } = await this.findWorkspace(workspaceId)
+
+    if (!rolloutStrategy) {
+      return { rolloutStrategy: 'anonymous' }
+    }
+
+    if (rolloutStrategy === 'anonymous-invite' || rolloutStrategy === 'authenticated-invite') {
+      let invite = await this.inviteCodesRepo.getWorkspaceCode(workspaceId)
+
+      // Invite code can be empty if workspaces was modified manually
+      if (!invite) {
+        invite = await this.resetInviteCode(workspaceId)
+      }
+
+      return { rolloutStrategy, ...invite }
+    }
+
+    return { rolloutStrategy }
+  }
+
+  async resetInviteCode(workspaceId: string, allowedUsages: number = UNLIMITED): Promise<WorkspaceInviteCode> {
+    const inviteCode = `INV-${nanoid('1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ', 10)}`
+    const newEntry = { workspaceId, inviteCode, allowedUsages }
+
+    if (await this.inviteCodesRepo.getWorkspaceCode(workspaceId)) {
+      await this.inviteCodesRepo.replaceCode(newEntry)
+    } else {
+      await this.inviteCodesRepo.createEntry(newEntry)
+    }
+
+    return newEntry
+  }
+
+  async consumeInviteCode(workspaceId: string, validateCode?: string): Promise<boolean> {
+    const { allowedUsages, inviteCode } = await this.inviteCodesRepo.getWorkspaceCode(workspaceId)
+
+    if (allowedUsages === 0 || (validateCode && inviteCode !== validateCode)) {
+      return false
+    }
+
+    if (allowedUsages !== -1) {
+      await this.inviteCodesRepo.decreaseRemainingUsage(workspaceId)
+    }
+
+    return true
+  }
+
+  async removeUserFromAllWorkspaces(email: string, strategy: string) {
+    const allWorkspaces = await this.getUserWorkspaces(email, strategy)
+    return Promise.map(allWorkspaces, wks => this.removeUserFromWorkspace(email, strategy, wks.workspace))
+  }
+
+  async removeUserFromWorkspace(email: string, strategy: string, workspace: string) {
+    return this.workspaceRepo.removeUserFromWorkspace(email, strategy, workspace)
+  }
+
+  async updateUserRole(email: string, strategy: string, workspace: string, newRole: string) {
+    return this.workspaceRepo.updateUserRole(email, strategy, workspace, newRole)
+  }
+
+  async findUser(email: string, strategy: string, workspace: string) {
+    const list = await this.workspaceRepo.getUserWorkspaces(email, strategy)
+    return list.find(x => x.workspace === workspace)
+  }
+
+  async getUserWorkspaces(email: string, strategy: string): Promise<WorkspaceUser[]> {
+    const userWorkspaces = await this.workspaceRepo.getUserWorkspaces(email, strategy)
+    return Promise.map(userWorkspaces, async userWorkspace => ({
+      ...userWorkspace,
+      workspaceName: await this.findWorkspaceName(userWorkspace.workspace)
+    }))
+  }
+
+  async getWorkspaceUsers(workspace: string) {
+    return this.workspaceRepo.getWorkspaceUsers(workspace)
+  }
+
+  async getWorkspaceUsersAttributes(
+    workspace: string,
+    filteredAttributes?: string[]
+  ): Promise<WorkspaceUserAttributes[]> {
+    const workspaceUsers = await this.workspaceRepo.getWorkspaceUsers(workspace)
+    const uniqStrategies = _.uniq(_.map(workspaceUsers, 'strategy'))
+    const usersInfo = await this._getUsersAttributes(workspaceUsers, uniqStrategies, filteredAttributes)
+
+    return workspaceUsers.map(u => ({ ...u, attributes: usersInfo[u.email.toLowerCase()] }))
+  }
+
+  private async _getUsersAttributes(users: WorkspaceUser[], strategies: string[], attributes: any) {
+    const attr = {}
+    const usersInfo = _.flatten(
+      await Promise.map(strategies, strategy => this._getUsersInfoForStrategy(users, strategy, attributes))
+    )
+
+    usersInfo.forEach(u => (attr[u.email] = { ...u.attributes, createdOn: u.createdOn, updatedOn: u.updatedOn }))
+    return attr
+  }
+
+  private async _getUsersInfoForStrategy(users: WorkspaceUser[], strategy: string, attributes: any) {
+    const emails = users.filter(x => x.strategy === strategy).map(x => x.email)
+    return this.usersRepo.getMultipleUserAttributes(emails, strategy, attributes)
+  }
+
+  async getUniqueCollaborators(): Promise<number> {
+    return this.workspaceRepo.getUniqueCollaborators()
+  }
+
+  async findRole(roleId: string, workspaceId: string): Promise<AuthRole> {
+    const workspace = await this.findWorkspace(workspaceId)
+    const role = [...workspace.roles, CHAT_USER_ROLE].find(r => r.id === roleId)
+
     if (!role) {
-      throw new Error(`Role "${roleId}" does not exists in workspace "${workspace.name}"`)
+      throw new NotFoundError(`Role "${roleId}" does not exist in workspace "${workspace.name}"`)
     }
     return role
   }
 
-  async getRoleForUser(email: string): Promise<AuthRole | undefined> {
-    const user = await this.findUser({ email })!
-    return user && this.findRole(user.role!)
+  async getBotWorkspaceId(botId: string) {
+    const workspaces = await this.getWorkspaces()
+    const workspace = workspaces.find(x => !!x.bots.find(bot => bot === botId))
+    return workspace?.id ?? 'default'
   }
 
-  async createUser(authUser: BasicAuthUser | ExternalAuthUser): Promise<AuthUser> {
-    const workspace = await this.getWorkspace()
-    const newUser = {
-      ...authUser,
-      created_on: new Date()
-    } as AuthUser
-
-    // If there's no users, make the first account's role as Admin
-    if (!workspace.users.length) {
-      newUser.role = workspace.adminRole
-      await this.configProvider.mergeBotpressConfig({ superAdmins: [newUser.email] })
-    }
-
-    workspace.users.push(newUser)
-    await this.save(workspace)
-
-    return newUser
+  async getRoleForUser(email: string, strategy: string, workspace: string): Promise<AuthRole | undefined> {
+    const user = await this.findUser(email, strategy, workspace)!
+    return user && this.findRole(user.role!, workspace)
   }
 
-  async updateUser(email: string, userData: Partial<AuthUser>) {
-    this.stats.track('user', 'update')
+  async getPipeline(workspaceId: string): Promise<Pipeline | undefined> {
+    const workspaces = await this.getWorkspaces()
+    const workspace = workspaces.find(x => x.id === workspaceId)
 
-    const workspace = await this.getWorkspace()
-    const original = (await this.findUser({ email }, '*')) as AuthUser
-    if (!original) {
-      throw Error('Cannot find user')
-    }
-
-    const newUser: AuthUser = {
-      ...original,
-      ...userData
-    }
-
-    const idx = _.findIndex(workspace.users, x => x.email === email)
-    workspace.users.splice(idx, 1, newUser)
-
-    await this.save(workspace)
+    return workspace?.pipeline
   }
 
-  async deleteUser(email: string) {
-    this.stats.track('user', 'delete')
-
-    const workspace = await this.getWorkspace()
-    const index = _.findIndex(workspace.users, x => x.email === email)
-
-    if (index > -1) {
-      workspace.users.splice(index, 1)
-      await this.save(workspace)
-    }
+  async hasPipeline(workspaceId: string): Promise<boolean> {
+    const pipeline = await this.getPipeline(workspaceId)
+    return !!pipeline && pipeline.length > 1
   }
 
-  async getPipeline(): Promise<Pipeline> {
-    const workspace = await this.getWorkspace()
-    // @deprecated > 11: this ensures that the workspace includes a pipeline which are now created by default
-    if (!workspace.pipeline) {
-      workspace.pipeline = [...DEFAULT_PIPELINE]
-      await this.save(workspace)
+  async listUsers(workspaceId?: string): Promise<WorkspaceUser[]> {
+    if (workspaceId) {
+      return this.getWorkspaceUsers(workspaceId)
     }
 
-    return workspace.pipeline
-  }
-
-  async hasPipeline(): Promise<boolean> {
-    return (await this.getPipeline()).length > 1
+    const workspaces = await this.getWorkspaces()
+    let wu: WorkspaceUser[] = []
+    for (const w of workspaces) {
+      const u = await this.getWorkspaceUsers(w.id)
+      wu = [...wu, ...u]
+    }
+    return wu
   }
 }

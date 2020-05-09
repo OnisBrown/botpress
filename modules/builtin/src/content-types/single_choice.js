@@ -18,17 +18,24 @@ function render(data) {
         title: c.title,
         payload: c.value.toUpperCase()
       })),
-      typing: data.typing
+      typing: data.typing,
+      markdown: data.markdown
     }
   ]
 }
 
 function renderMessenger(data) {
-  return [
-    {
+  const events = []
+
+  if (data.typing) {
+    events.push({
       type: 'typing',
       value: data.typing
-    },
+    })
+  }
+
+  return [
+    ...events,
     {
       text: data.text,
       quick_replies: data.choices.map(c => ({
@@ -40,33 +47,63 @@ function renderMessenger(data) {
   ]
 }
 
-function renderElement(data, channel) {
-  if (channel === 'web' || channel === 'api' || channel === 'telegram') {
-    return render(data)
-  } else if (channel === 'messenger') {
-    return renderMessenger(data)
+function renderSlack(data) {
+  const events = []
+
+  if (data.typing) {
+    events.push({
+      type: 'typing',
+      value: data.typing
+    })
   }
 
-  return [] // TODO Handle channel not supported
+  return [
+    ...events,
+    {
+      text: data.text,
+      quick_replies: {
+        type: 'actions',
+        elements: data.choices.map((q, idx) => ({
+          type: 'button',
+          action_id: 'replace_buttons' + idx,
+          text: {
+            type: 'plain_text',
+            text: q.title
+          },
+          value: q.value.toUpperCase()
+        }))
+      }
+    }
+  ]
+}
+
+function renderElement(data, channel) {
+  if (channel === 'messenger') {
+    return renderMessenger(data)
+  } else if (channel === 'slack') {
+    return renderSlack(data)
+  } else {
+    return render(data)
+  }
 }
 
 module.exports = {
   id: 'builtin_single-choice',
   group: 'Built-in Messages',
-  title: 'Single Choice',
+  title: 'module.builtin.types.singleChoice.title',
 
   jsonSchema: {
-    description: 'Suggest choices to the user with the intention of picking only one (with an optional message)',
+    description: 'module.builtin.types.singleChoice.description',
     type: 'object',
     required: ['choices'],
     properties: {
       text: {
         type: 'string',
-        title: 'Message'
+        title: 'message'
       },
       choices: {
         type: 'array',
-        title: 'Choices',
+        title: 'module.builtin.types.singleChoice.choice',
         minItems: 1,
         maxItems: 10,
         items: {
@@ -74,18 +111,22 @@ module.exports = {
           required: ['title', 'value'],
           properties: {
             title: {
-              description: 'The title of the choice (this is what gets shown to the user)',
+              description: 'module.builtin.types.singleChoice.itemTitle',
               type: 'string',
               title: 'Message'
             },
             value: {
-              description:
-                'The value that your bot gets when the user picks this choice (usually hidden from the user)',
+              description: 'module.builtin.types.singleChoice.itemValue',
               type: 'string',
               title: 'Value'
             }
           }
         }
+      },
+      markdown: {
+        type: 'boolean',
+        title: 'module.builtin.useMarkdown',
+        default: true
       },
       ...base.typingIndicators
     }

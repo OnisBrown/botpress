@@ -1,13 +1,17 @@
 import React from 'react'
-import style from './style.scss'
-import colors from '../colors.scss'
-import classnames from 'classnames'
+import style from '../style.scss'
+import { Tag } from '@blueprintjs/core'
+import { confirmDialog, lang } from 'botpress/shared'
 
 export default class SlotItem extends React.Component {
-  handleDeleteClicked = e => {
+  handleDeleteClicked = async e => {
     e.preventDefault()
 
-    if (confirm('Are you sure you want to delete this slot and all associated tagging from all utterances?')) {
+    if (
+      await confirmDialog(lang.tr('module.nlu.slots.deleteMessage'), {
+        acceptLabel: lang.tr('delete')
+      })
+    ) {
       this.props.onDelete && this.props.onDelete(this.props.slot)
     }
   }
@@ -18,17 +22,19 @@ export default class SlotItem extends React.Component {
   }
 
   render() {
+    // TODO replace edit link with a simple click on the tag
+    // TODO replace delete link with simple click on the remove tag
     const { slot } = this.props
-    const className = classnames(style.entityLabel, colors['label-colors-' + slot.color])
     return (
       <li className={style.entityItem}>
-        <span className={className}>{slot.name}</span>
-        <span className={style.type}>{slot.type}</span>
+        <Tag className={style[`label-colors-${slot.color}`]} round large>
+          {slot.name}
+        </Tag>
         <a onClick={this.handleDeleteClicked} className={style.link}>
-          Delete
+          {lang.tr('delete')}
         </a>
         <a onClick={this.handleEditClicked} className={style.link}>
-          Edit
+          {lang.tr('edit')}
         </a>
       </li>
     )

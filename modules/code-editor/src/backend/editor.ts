@@ -1,3 +1,4 @@
+import 'bluebird-global'
 import * as sdk from 'botpress/sdk'
 import fs from 'fs'
 import _ from 'lodash'
@@ -5,9 +6,20 @@ import path from 'path'
 
 import { Config } from '../config'
 
-import { EditableFile, FileType, TypingDefinitions } from './typings'
+import { FileDefinition, FileTypes } from './definitions'
+import { EditorError } from './editorError'
+import { EditableFile, FilePermissions, FilesDS, FileType, TypingDefinitions } from './typings'
+import {
+  assertValidFilename,
+  buildRestrictedProcessVars,
+  getBuiltinExclusion,
+  getFileLocation,
+  RAW_TYPE
+} from './utils'
 
-const FILENAME_REGEX = /^[0-9a-zA-Z_\-.]+$/
+export const FILENAME_REGEX = /^[0-9a-zA-Z_\-.]+$/
+
+const RAW_FILES_FILTERS = ['**/*.map']
 
 export default class Editor {
   private bp: typeof sdk
@@ -15,45 +27,149 @@ export default class Editor {
   private _typings: TypingDefinitions
   private _config: Config
 
-  constructor(bp: typeof sdk, botId: string, config: Config) {
+  constructor(bp: typeof sdk, config: Config) {
     this.bp = bp
-    this._botId = botId
     this._config = config
   }
 
-  async fetchFiles() {
-    return {
-      actionsGlobal: this._config.allowGlobal && (await this._loadFiles('/actions', 'action')),
-      actionsBot: await this._loadFiles('/actions', 'action', this._botId)
-    }
+  forBot(botId: string) {
+    this._botId = botId
+    return this
   }
 
-  async _validateMetadata({ name, botId, type }: Partial<EditableFile>) {
-    if (!botId || !botId.length) {
-      if (!this._config.allowGlobal) {
-        throw new Error(`Global files are restricted, please check your configuration`)
-      }
-    } else {
-      if (botId !== this._botId) {
-        throw new Error(`Please switch to the correct bot to change its actions.`)
+  async getAllFiles(permissions: FilePermissions, rawFiles?: boolean, listBuiltin?: boolean): Promise<FilesDS> {
+    if (rawFiles && permissions['root.raw'].read) {
+      return {
+        raw: await this.loadRawFiles()
       }
     }
 
-    if (type !== 'action') {
-      throw new Error('Invalid file type Only actions are allowed at the moment')
-    }
+    const files: FilesDS = {}
 
-    if (!FILENAME_REGEX.test(name)) {
-      throw new Error('Filename has invalid characters')
-    }
+    await Promise.mapSeries(Object.keys(permissions), async type => {
+      const userPermissions = permissions[type]
+      if (userPermissions.read) {
+        files[type] = await this.loadFiles(userPermissions.type, !userPermissions.isGlobal && this._botId, listBuiltin)
+      }
+    })
+
+    const examples = await this._getExamples()
+    files['action_example'] = examples.filter(x => x.type === 'action_legacy')
+    files['hook_example'] = examples.filter(x => x.type === 'hook')
+
+    return files
+  }
+
+  async fileExists(file: EditableFile): Promise<boolean> {
+    const { folder, filename } = getFileLocation(file)
+    return this._getGhost(file).fileExists(folder, filename)
+  }
+
+  async readFileContent(file: EditableFile): Promise<string> {
+    const { folder, filename } = getFileLocation(file)
+    return this._getGhost(file).readFileAsString(folder, filename)
+  }
+
+  async readFileBuffer(file: EditableFile): Promise<Buffer> {
+    const { folder, filename } = getFileLocation(file)
+    return this._getGhost(file).readFileAsBuffer(folder, filename)
   }
 
   async saveFile(file: EditableFile): Promise<void> {
-    this._validateMetadata(file)
-    const { location, botId, content } = file
-    const ghost = botId ? this.bp.ghost.forBot(this._botId) : this.bp.ghost.forGlobal()
+    const shouldSyncToDisk = FileTypes[file.type].ghost.shouldSyncToDisk
+    const { folder, filename } = getFileLocation(file)
 
-    return ghost.upsertFile('/actions', location, content)
+    return this._getGhost(file).upsertFile(folder, filename, file.content, {
+      syncDbToDisk: shouldSyncToDisk
+    })
+  }
+
+  async loadRawFiles(): Promise<EditableFile[]> {
+    const files = await this.bp.ghost.forRoot().directoryListing('/', '*.*', RAW_FILES_FILTERS, true)
+
+    return Promise.map(files, async (filepath: string) => ({
+      name: path.basename(filepath),
+      type: 'raw' as FileType,
+      location: filepath,
+      content: undefined
+    }))
+  }
+
+  async loadFiles(fileTypeId: string, botId?: string, listBuiltin?: boolean): Promise<EditableFile[]> {
+    const def: FileDefinition = FileTypes[fileTypeId]
+    const { baseDir, dirListingAddFields } = def.ghost
+
+    if ((!def.allowGlobal && !botId) || (!def.allowScoped && botId)) {
+      return []
+    }
+
+    const excluded = this._config.includeBuiltin || listBuiltin ? undefined : getBuiltinExclusion()
+    const ghost = botId ? this.bp.ghost.forBot(botId) : this.bp.ghost.forGlobal()
+    const files = def.filenames
+      ? def.filenames
+      : await ghost.directoryListing(baseDir, def.isJSON ? '*.json' : '*.js', excluded, true)
+
+    return Promise.map(files, async (filepath: string) => ({
+      name: path.basename(filepath),
+      type: fileTypeId as FileType,
+      location: filepath,
+      content: undefined,
+      botId,
+      ...(dirListingAddFields && dirListingAddFields(filepath))
+    }))
+  }
+
+  private async _getExamples(): Promise<EditableFile[]> {
+    const files = await this.bp.ghost.forGlobal().directoryListing('/examples', '*.js')
+
+    return Promise.map(files, async (filepath: string) => {
+      const isHook = filepath.startsWith('examples/hooks')
+      const location = filepath.replace('examples/actions/', '').replace('examples/hooks/', '')
+
+      return {
+        name: path.basename(filepath),
+        type: (isHook ? 'hook' : 'action_legacy') as FileType,
+        location,
+        readOnly: true,
+        isExample: true,
+        content: await this.bp.ghost.forGlobal().readFileAsString('/examples', filepath),
+        ...(isHook && { hookType: location.substr(0, location.indexOf('/')) })
+      }
+    })
+  }
+
+  private _getGhost(file: EditableFile): sdk.ScopedGhostService {
+    if (file.type === RAW_TYPE) {
+      return this.bp.ghost.forRoot()
+    }
+    return file.botId ? this.bp.ghost.forBot(this._botId) : this.bp.ghost.forGlobal()
+  }
+
+  async deleteFile(file: EditableFile): Promise<void> {
+    const fileDef = FileTypes[file.type]
+    if (fileDef.canDelete && !fileDef.canDelete(file)) {
+      throw new Error('This file cannot be deleted.')
+    }
+
+    const { folder, filename } = getFileLocation(file)
+    await this._getGhost(file).deleteFile(folder, filename)
+  }
+
+  async renameFile(file: EditableFile, newName: string): Promise<void> {
+    if (file.type !== RAW_TYPE) {
+      assertValidFilename(newName)
+    }
+
+    const { folder, filename } = getFileLocation(file)
+    const newFilename = filename.replace(filename, newName)
+
+    const ghost = this._getGhost(file)
+
+    if (await ghost.fileExists(folder, newFilename)) {
+      throw new EditorError('File already exists')
+    }
+
+    return ghost.renameFile(folder, filename, newFilename)
   }
 
   async loadTypings() {
@@ -62,69 +178,51 @@ export default class Editor {
     }
 
     const sdkTyping = fs.readFileSync(path.join(__dirname, '/../botpress.d.js'), 'utf-8')
+    const nodeTyping = fs.readFileSync(path.join(__dirname, `/../typings/node.d.txt`), 'utf-8')
+
+    const ghost = this.bp.ghost.forRoot()
+    const botConfigSchema = await ghost.readFileAsString('/', 'bot.config.schema.json')
+    const botpressConfigSchema = await ghost.readFileAsString('/', 'botpress.config.schema.json')
+
+    // Required so array.includes() can be used without displaying an error
+    const es6include = fs.readFileSync(path.join(__dirname, '/../typings/es6include.txt'), 'utf-8')
+
+    const moduleTypings = await this.getModuleTypings()
 
     this._typings = {
-      'process.d.ts': this._buildRestrictedProcessVars(),
-      'node.d.ts': this._getNodeTypings().toString(),
-      'botpress.d.ts': sdkTyping.toString().replace(`'botpress/sdk'`, `sdk`)
+      'process.d.ts': buildRestrictedProcessVars(),
+      'node.d.ts': nodeTyping.toString(),
+      'botpress.d.ts': sdkTyping.toString().replace(`'botpress/sdk'`, `sdk`),
+      'bot.config.schema.json': botConfigSchema,
+      'botpress.config.schema.json': botpressConfigSchema,
+      'es6include.d.ts': es6include.toString(),
+      ...moduleTypings
     }
 
     return this._typings
   }
 
-  private _getNodeTypings() {
-    const getTypingPath = folder => path.join(__dirname, `/../../${folder}/@types/node/index.d.ts`)
-
-    if (fs.existsSync(getTypingPath('node_modules'))) {
-      return fs.readFileSync(getTypingPath('node_modules'), 'utf-8')
+  async getModuleTypings() {
+    const cwd = path.resolve(__dirname, '../../..')
+    try {
+      return _.reduce(
+        fs.readdirSync(cwd),
+        (result, dir) => {
+          const pkgPath = path.join(cwd, dir, 'package.json')
+          if (fs.existsSync(pkgPath)) {
+            const moduleName = require(pkgPath).name
+            const schemaPath = path.join(cwd, dir, 'assets/config.schema.json')
+            result[`modules/${moduleName}/config.schema.json`] = fs.existsSync(schemaPath)
+              ? fs.readFileSync(schemaPath, 'utf-8')
+              : '{}'
+          }
+          return result
+        },
+        {}
+      )
+    } catch (e) {
+      this.bp.logger.attachError(e).error('Error reading typings')
+      return {}
     }
-    return fs.readFileSync(getTypingPath('node_production_modules'), 'utf-8')
-  }
-
-  private async _loadFiles(rootFolder: string, type: FileType, botId?: string): Promise<EditableFile[]> {
-    const ghost = botId ? this.bp.ghost.forBot(botId) : this.bp.ghost.forGlobal()
-
-    return Promise.map(await ghost.directoryListing(rootFolder, '*.js'), async (filepath: string) => {
-      return {
-        name: path.basename(filepath),
-        location: filepath,
-        content: await ghost.readFileAsString(rootFolder, filepath),
-        type,
-        botId
-      }
-    })
-  }
-
-  private _buildRestrictedProcessVars() {
-    const exposedEnv = {
-      ..._.pickBy(process.env, (_value, name) => name.startsWith('EXPOSED_')),
-      ..._.pick(process.env, 'TZ', 'LANG', 'LC_ALL', 'LC_CTYPE')
-    }
-    const root = this._extractInfo(_.pick(process, 'HOST', 'PORT', 'EXTERNAL_URL', 'PROXY'))
-    const exposed = this._extractInfo(exposedEnv)
-
-    return `
-    declare var process: RestrictedProcess;
-    interface RestrictedProcess {
-      ${root.map(x => {
-        return `/** Current value: ${x.value} */
-${x.name}: ${x.type}
-`
-      })}
-
-      env: {
-        ${exposed.map(x => {
-          return `/** Current value: ${x.value} */
-  ${x.name}: ${x.type}
-  `
-        })}
-      }
-    }`
-  }
-
-  private _extractInfo(keys) {
-    return Object.keys(keys).map(name => {
-      return { name, value: keys[name], type: typeof keys[name] }
-    })
   }
 }

@@ -17,6 +17,13 @@ $elementHeight: 40px;
   }
 }
 
+.hint {
+  color: #738694;
+  span {
+    margin-left: 10px;
+  }
+}
+
 .elementRemove {
   padding-left: 10px;
   display: none;
@@ -65,9 +72,6 @@ $elementHeight: 40px;
   }
 }
 
-.questionsList {
-}
-
 .pale {
   opacity: 0.8;
 }
@@ -80,26 +84,11 @@ $elementHeight: 40px;
   }
 }
 
-.csvContainer {
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-
-  .csvButton {
-    padding: 3px 17px;
-    font-weight: 900;
-    color: rgba(0, 0, 0, 0.45);
-    text-shadow: 1px 0;
-    border: 1px solid rgba(0, 0, 0, 0.45);
-
-    &:last-child {
-      margin-left: 20px;
-    }
-  }
-}
-
 .qnaContainer {
-  padding: 25px;
+  padding: 0;
+  height: 100%;
+  overflow-y: auto;
+  margin: 0;
 }
 
 .qnaNavBar {
@@ -110,7 +99,19 @@ $elementHeight: 40px;
 }
 
 .qnaHeader {
-  margin-bottom: 20px;
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  margin: 15px 0 10px;
+}
+
+.headerBtns {
+  display: flex;
+  align-items: flex-start;
+
+  button {
+    margin-left: 5px;
+  }
 }
 
 .searchBar {
@@ -120,8 +121,76 @@ $elementHeight: 40px;
   margin-bottom: 20px;
 }
 
+.searchBarLite {
+  display: flex;
+  justify-content: space-between;
+}
+
 .searchField {
+  height: 38px;
   width: 200px;
+}
+
+.questionTable {
+  background: #fff;
+  border: 1px solid #e3e3e3;
+  border-top: none;
+  border-radius: 3px;
+  display: table;
+  width: 100%;
+}
+
+.questionTableRow {
+  display: table-row;
+  transition: background 0.3s;
+
+  &:not(.header) {
+    cursor: pointer;
+  }
+
+  &:hover {
+    background: #f5f5f5;
+  }
+
+  &.header .questionTableCell {
+    background: #f5f5f5;
+    border-top: 1px solid #e3e3e3;
+    font-size: 14px;
+    font-weight: 600;
+    margin-right: 10px;
+    padding: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  &.last .questionTableCell {
+    border-bottom: none;
+  }
+}
+
+.redirectTooltip {
+  margin-left: 5px;
+}
+
+.questionTableCell {
+  border-bottom: 1px solid #e3e3e3;
+  color: var(--c-text);
+  display: table-cell;
+  padding: 5px 10px;
+  vertical-align: middle;
+
+  &:not(.actions):not(.question) {
+    border-left: 1px solid #e3e3e3;
+  }
+
+  &.actions {
+    width: 115px;
+  }
+
+  &.question {
+    width: 30%;
+  }
 }
 
 .categoryFilter {
@@ -129,6 +198,10 @@ $elementHeight: 40px;
   margin: 0 15px 0 15px;
   font-weight: 500;
   z-index: 4;
+
+  input {
+    height: 25px;
+  }
 
   .dropdown-button {
     border-left: none;
@@ -150,27 +223,18 @@ $elementHeight: 40px;
   flex-wrap: wrap;
   justify-content: space-between;
   padding: 13px;
-
-  &:hover {
-    .itemActionDelete {
-      display: inherit !important;
-    }
-  }
+  align-items: center;
+  min-height: 70px;
 }
 
 .itemContainer {
-  flex: 0 1 75%;
-}
-
-.itemQuestionsTitle,
-.itemAnswerTitle {
-  font-size: 18px;
-  font-weight: 600;
-  margin-right: 10px;
+  align-items: center;
+  display: flex;
+  flex: 1 0 80%;
+  justify-content: space-between;
 }
 
 .firstQuestionTitle {
-  font-size: 18px;
   font-weight: 600;
   color: var(--c-brand);
   cursor: pointer;
@@ -186,115 +250,32 @@ $elementHeight: 40px;
   flex-direction: column;
 }
 
-.itemAnswerText {
-  color: rgb(182, 182, 182);
-  font-weight: 600;
-}
-
 .itemAction {
+  align-items: center;
   display: flex;
-  flex: 1 1 25%;
+  flex: 0 1 20%;
   justify-content: flex-end;
-  align-items: flex-start;
-  padding-top: 15px;
+
+  label {
+    margin-bottom: 0;
+  }
+
+  button {
+    cursor: pointer;
+  }
 }
 
 .itemRedirect {
   display: flex;
 }
 
-.toggleButton {
-  margin-bottom: 0;
-  margin-right: 30px;
-}
-
-.itemActionDelete {
-  display: none !important;
-  margin-right: 30px;
-  cursor: pointer;
-
-  &:hover {
-    color: red;
-  }
-}
-
-.itemActionEdit {
-  cursor: pointer;
-
-  &:hover {
-    color: #2196f3;
-  }
+.itemAction button {
+  margin-left: 5px;
 }
 
 .questionCategory {
   font-weight: 600;
   font-size: 16px;
-}
-
-.questionCategoryTitle {
-  color: #b6b6b6;
-}
-
-.newQnaModal {
-  display: flex !important;
-  align-items: center;
-  justify-content: center;
-}
-
-.qnaModalBody,
-.qnaModalFooter {
-  background-color: #faf8fb;
-  padding-right: 30px;
-}
-
-.qnaModalHeader {
-  background-color: #d9d7da;
-  border-top-left-radius: 10px;
-  border-top-right-radius: 10px;
-
-  h4 {
-    font-weight: 900;
-    color: #000;
-  }
-}
-
-.qnaModalBody {
-  border-radius: 10px;
-}
-
-.qnaModalFooter {
-  border-top: none;
-  border-bottom-left-radius: 10px;
-  border-bottom-right-radius: 10px;
-}
-
-.qnaCategorySelect {
-  width: 250px;
-  margin-top: 5px;
-}
-
-.qnaQuestionsHint {
-  color: #000;
-}
-
-.qnaQuestionsTextarea {
-  margin-top: 5px;
-  height: 100px !important;
-}
-
-.qnaSectionTitle {
-  display: block;
-  font-weight: 600;
-  color: #000;
-  font-size: 18px;
-}
-
-.qnaSection {
-  margin-top: 20px;
-}
-
-.qnaAnswerCheck {
-  display: flex;
 }
 
 .qnaAndOr {
@@ -352,77 +333,6 @@ $elementHeight: 40px;
   }
 }
 
-.qnaRedirectToFlowCheck {
-  display: flex;
-  align-items: center;
-  color: #000;
-
-  .qnaRedirectToFlowCheckCheckbox {
-    margin-top: 0;
-  }
-}
-
-.qnaRedirectToFlowCheckSelect,
-.qnaRedirectNodeSelect {
-  margin-top: 5px;
-}
-
-.qnaRedirectToFlowCheckSelect {
-  width: calc(100% - 15px);
-  margin-left: 15px;
-}
-
-.qnaRedirectNodeTitle {
-  color: #000;
-}
-
-.qnaModalFooterCancelBtn,
-.qnaModalFooterSaveBtn {
-  font-weight: 600;
-  font-size: 18px;
-  color: #fff;
-  line-height: 0.9em;
-  padding: 5px;
-  width: 120px;
-  background-color: #b2b0b3;
-}
-
-.qnaModalFooterCancelBtn {
-  margin-right: 20px;
-
-  &:hover,
-  &:focus,
-  &:active {
-    background-color: #9e9d9e;
-    color: #fff;
-  }
-
-  &:focus {
-    &:active {
-      background-color: #9e9d9e;
-      color: #fff;
-    }
-  }
-}
-
-.qnaModalFooterSaveBtn {
-  background-color: #14a77b;
-
-  &:hover,
-  &:focus,
-  &:active {
-    background-color: #108b66;
-    color: #fff;
-  }
-
-  &:focus {
-    &:active {
-      background-color: #108b66;
-      color: #fff;
-    }
-  }
-}
-
 .qnaCategoryError {
   border-color: red;
 }
@@ -449,4 +359,33 @@ $elementHeight: 40px;
 }
 .variationDelete {
   display: none;
+}
+
+.tooltip {
+  li {
+    max-width: 800px;
+    margin-left: -20px;
+  }
+
+  &.lite li {
+    max-width: 300px;
+  }
+}
+
+.liteItemContainer {
+  width: 100%;
+  margin-top: 10px;
+  overflow-y: scroll;
+  height: 420px;
+}
+
+.liteHeader {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.liteSearch {
+  width: 250;
+  margin-bottom: 15;
 }

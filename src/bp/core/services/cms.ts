@@ -1,23 +1,23 @@
 import { IO, Logger } from 'botpress/sdk'
-import { ContentElement, ContentType, SearchParams } from 'botpress/sdk'
-import { KnexExtension } from 'common/knex'
+import { ContentElement, ContentType, KnexExtended, SearchParams } from 'botpress/sdk'
 import { renderRecursive, renderTemplate } from 'core/misc/templating'
 import { ModuleLoader } from 'core/module-loader'
 import { inject, injectable, tagged } from 'inversify'
-import Knex from 'knex'
+import Joi from 'joi'
 import _ from 'lodash'
 import nanoid from 'nanoid'
 import path from 'path'
 import { VError } from 'verror'
 
+import { IDisposeOnExit } from '../../common/typings'
 import { ConfigProvider } from '../config/config-loader'
 import { LoggerProvider } from '../logger/logger'
 import { CodeFile, SafeCodeSandbox } from '../misc/code-sandbox'
-import { IDisposeOnExit } from '../misc/interfaces'
 import { TYPES } from '../types'
 
 import { GhostService } from '.'
 import { JobService } from './job-service'
+import MediaService from './media'
 
 const UNLIMITED_ELEMENTS = -1
 export const DefaultSearchParams: SearchParams = {
@@ -26,11 +26,20 @@ export const DefaultSearchParams: SearchParams = {
   count: 50
 }
 
+export const CmsImportSchema = Joi.array().items(
+  Joi.object().keys({
+    id: Joi.string().required(),
+    contentType: Joi.string().required(),
+    formData: Joi.object().required()
+  })
+)
+
 @injectable()
 export class CMSService implements IDisposeOnExit {
   broadcastAddElement: Function = this.local__addElementToCache
   broadcastUpdateElement: Function = this.local__updateElementFromCache
   broadcastRemoveElements: Function = this.local__removeElementsFromCache
+  broadcastInvalidateForBot: Function = this.local__invalidateForBot
 
   private readonly contentTable = 'content_elements'
   private readonly typesDir = 'content-types'
@@ -47,13 +56,14 @@ export class CMSService implements IDisposeOnExit {
     @inject(TYPES.LoggerProvider) private loggerProvider: LoggerProvider,
     @inject(TYPES.GhostService) private ghost: GhostService,
     @inject(TYPES.ConfigProvider) private configProvider: ConfigProvider,
-    @inject(TYPES.InMemoryDatabase) private memDb: Knex & KnexExtension,
+    @inject(TYPES.InMemoryDatabase) private memDb: KnexExtended,
     @inject(TYPES.JobService) private jobService: JobService,
+    @inject(TYPES.MediaService) private mediaService: MediaService,
     @inject(TYPES.ModuleLoader) private moduleLoader: ModuleLoader
   ) {}
 
   disposeOnExit() {
-    this.sandbox && this.sandbox.dispose()
+    this.sandbox?.dispose()
   }
 
   async initialize() {
@@ -62,6 +72,7 @@ export class CMSService implements IDisposeOnExit {
     this.broadcastUpdateElement = await this.jobService.broadcast<ContentElement>(
       this.local__updateElementFromCache.bind(this)
     )
+    this.broadcastInvalidateForBot = await this.jobService.broadcast<string>(this.local__invalidateForBot.bind(this))
 
     await this.prepareDb()
     await this._loadContentTypesFromFiles()
@@ -81,32 +92,52 @@ export class CMSService implements IDisposeOnExit {
     })
   }
 
-  async loadElementsForBot(botId: string): Promise<any[]> {
-    const fileNames = await this.ghost.forBot(botId).directoryListing(this.elementsDir, '*.json')
+  async getAllElements(botId: string): Promise<ContentElement[]> {
+    const fileNames = await this.ghost.forBot(botId).directoryListing(this.elementsDir, '*.json', 'library.json')
     let contentElements: ContentElement[] = []
 
     for (const fileName of fileNames) {
-      const contentType = path.basename(fileName).replace(/.json$/i, '')
-      const fileContentElements = await this.ghost
-        .forBot(botId)
-        .readFileAsObject<ContentElement[]>(this.elementsDir, fileName)
+      try {
+        const contentType = path.basename(fileName).replace(/\.json$/i, '')
+        const fileContentElements = await this.ghost
+          .forBot(botId)
+          .readFileAsObject<ContentElement[]>(this.elementsDir, fileName)
 
-      fileContentElements.forEach(el => Object.assign(el, { contentType }))
-      contentElements = _.concat(contentElements, fileContentElements)
+        fileContentElements.forEach(el => Object.assign(el, { contentType }))
+        contentElements = _.concat(contentElements, fileContentElements)
+      } catch (err) {
+        throw new Error(`while processing elements of "${fileName}": ${err}`)
+      }
     }
 
-    const elements = await Promise.map(contentElements, element => {
-      return this.memDb(this.contentTable)
-        .insert(this.transformItemApiToDb(botId, element))
-        .catch(err => {
-          // ignore duplicate key errors
-          // TODO: Knex error handling
-        })
-    })
+    return contentElements
+  }
 
-    await this.recomputeElementsForBot(botId)
+  async loadElementsForBot(botId: string): Promise<any[]> {
+    try {
+      const contentElements = await this.getAllElements(botId)
 
-    return elements
+      const elements = await Promise.map(contentElements, element => {
+        return this.memDb(this.contentTable)
+          .insert(this.transformItemApiToDb(botId, element))
+          .catch(err => {
+            // ignore duplicate key errors
+            // TODO: Knex error handling
+          })
+      })
+
+      await this.recomputeElementsForBot(botId)
+
+      return elements
+    } catch (err) {
+      throw new Error(`while processing content elements: ${err}`)
+    }
+  }
+
+  async deleteAllElements(botId: string): Promise<void> {
+    const files = await this.ghost.forBot(botId).directoryListing(this.elementsDir, '*.json')
+    await Promise.map(files, file => this.ghost.forBot(botId).deleteFile(this.elementsDir, file))
+    await this.clearElementsFromCache(botId)
   }
 
   async clearElementsFromCache(botId: string) {
@@ -180,15 +211,13 @@ export class CMSService implements IDisposeOnExit {
       query = query.andWhere(builder => builder.whereIn('id', ids))
     }
 
-    filters &&
-      filters.forEach(filter => {
-        query = query.andWhere(filter.column, 'like', `%${filter.value}%`)
-      })
+    filters?.forEach(filter => {
+      query = query.andWhere(filter.column, 'like', `%${filter.value}%`)
+    })
 
-    sortOrder &&
-      sortOrder.forEach(sort => {
-        query = query.orderBy(sort.column, sort.desc ? 'desc' : 'asc')
-      })
+    sortOrder?.forEach(sort => {
+      query = query.orderBy(sort.column, sort.desc ? 'desc' : 'asc')
+    })
 
     if (count !== UNLIMITED_ELEMENTS) {
       query = query.limit(count)
@@ -203,7 +232,7 @@ export class CMSService implements IDisposeOnExit {
   async getContentElement(botId: string, id: string, language?: string): Promise<ContentElement> {
     const element = await this.memDb(this.contentTable)
       .where({ botId, id })
-      .get(0)
+      .first()
 
     const deserialized = this.transformDbItemToApi(element)
     return language ? this._translateElement(deserialized, language) : deserialized
@@ -216,11 +245,16 @@ export class CMSService implements IDisposeOnExit {
     return Promise.map(apiElements, el => (language ? this._translateElement(el, language) : el))
   }
 
-  async countContentElements(botId: string): Promise<number> {
-    return this.memDb(this.contentTable)
-      .where({ botId })
+  async countContentElements(botId?: string): Promise<number> {
+    let query = this.memDb(this.contentTable)
+
+    if (botId) {
+      query = query.where({ botId })
+    }
+
+    return query
       .count('* as count')
-      .get(0)
+      .first()
       .then(row => (row && Number(row.count)) || 0)
   }
 
@@ -229,7 +263,7 @@ export class CMSService implements IDisposeOnExit {
       .where({ botId })
       .andWhere({ contentType })
       .count('* as count')
-      .get(0)
+      .first()
       .then(row => (row && Number(row.count)) || 0)
   }
 
@@ -239,8 +273,30 @@ export class CMSService implements IDisposeOnExit {
 
     await this.broadcastRemoveElements(botId, ids)
 
+    this.deleteMedia(botId, elements)
+
     const contentTypes = _.uniq(_.map(elements, 'contentType'))
     await Promise.mapSeries(contentTypes, contentTypeId => this._writeElementsToFile(botId, contentTypeId))
+  }
+
+  getMediaFiles(formData): string[] {
+    const media = '/media/'
+    const iterator = (result: string[], value, key: string) => {
+      if (key.startsWith('image') && value.includes(media)) {
+        result.push(value.substr(value.indexOf(media) + media.length))
+      } else if (key.startsWith('items$')) {
+        value.forEach(e => _.reduce(e, iterator, result))
+      }
+      return result
+    }
+    return _.reduce(formData, iterator, []).filter(Boolean)
+  }
+
+  deleteMedia(botId: string, elements: ContentElement[]) {
+    _.map(elements, 'formData').forEach(formData => {
+      const filesToDelete = this.getMediaFiles(formData)
+      filesToDelete.forEach(e => this.mediaService.deleteFile(botId, e))
+    })
   }
 
   async getAllContentTypes(botId?: string): Promise<ContentType[]> {
@@ -266,12 +322,21 @@ export class CMSService implements IDisposeOnExit {
       .where('contentType', contentTypeId)
       .orderByRaw('random()')
       .limit(1)
-      .get(0)
+      .first()
+      .then()
   }
 
   private _generateElementId(contentTypeId: string): string {
     const prefix = contentTypeId.replace(/^#/, '')
     return `${prefix}-${nanoid(6)}`
+  }
+
+  async elementIdExists(botId: string, id: string): Promise<boolean> {
+    const element = await this.memDb(this.contentTable)
+      .where({ botId, id })
+      .first()
+
+    return !!element
   }
 
   async createOrUpdateContentElement(
@@ -312,6 +377,9 @@ export class CMSService implements IDisposeOnExit {
 
     if (!contentElementId) {
       contentElementId = this._generateElementId(contentTypeId)
+    }
+
+    if (!(await this.elementIdExists(botId, contentElementId))) {
       await this.broadcastAddElement(botId, body, contentElementId, contentType.id)
       const created = await this.getContentElement(botId, contentElementId)
 
@@ -413,35 +481,40 @@ export class CMSService implements IDisposeOnExit {
     const { languages, defaultLanguage } = await this.configProvider.getBotConfig(botId)
 
     for (const contentType of this.contentTypes) {
-      // @ts-ignore
-      await this.memDb(this.contentTable)
-        .select('id', 'formData', 'botId')
-        .where('contentType', contentType.id)
-        .andWhere({ botId })
-        .then()
-        .each(async (element: any) => {
-          const computedProps = await this.fillComputedProps(
-            contentType,
-            JSON.parse(element.formData),
-            languages,
-            defaultLanguage
-          )
-          element = { ...element, ...computedProps }
+      let elementId
+      try {
+        await this.memDb(this.contentTable)
+          .select('id', 'formData', 'botId')
+          .where('contentType', contentType.id)
+          .andWhere({ botId })
+          .then<Iterable<any>>()
+          .each(async (element: any) => {
+            elementId = element.id
+            const computedProps = await this.fillComputedProps(
+              contentType,
+              JSON.parse(element.formData),
+              languages,
+              defaultLanguage
+            )
+            element = { ...element, ...computedProps }
 
-          return this.memDb(this.contentTable)
-            .where('id', element.id)
-            .andWhere({ botId })
-            .update(this.transformItemApiToDb(botId, element))
-            .catch(err => {
-              throw new VError(err, `Could not update the element for ID "${element.id}"`)
-            })
-        })
+            return this.memDb(this.contentTable)
+              .where('id', element.id)
+              .andWhere({ botId })
+              .update(this.transformItemApiToDb(botId, element))
+              .catch(err => {
+                throw new VError(err, `Could not update the element for ID "${element.id}"`)
+              })
+          })
+      } catch (err) {
+        throw new Error(`while computing elements of type "${contentType.id}" (element: ${elementId}): ${err}`)
+      }
     }
   }
 
   private async fillComputedProps(contentType: ContentType, formData: object, languages: string[], defaultLanguage) {
     if (formData == undefined) {
-      throw new Error('"formData" must be a valid object')
+      throw new Error(`"formData" must be a valid object (content type: ${contentType.id})`)
     }
 
     const expandedFormData = await this.resolveRefs(formData)
@@ -476,7 +549,7 @@ export class CMSService implements IDisposeOnExit {
     }, {})
   }
 
-  async translateContentProps(botId, fromLang, toLang) {
+  async translateContentProps(botId: string, fromLang: string | undefined, toLang: string) {
     const elements = await this.listContentElements(botId, undefined, { from: 0, count: UNLIMITED_ELEMENTS })
 
     for (const el of elements) {
@@ -524,10 +597,17 @@ export class CMSService implements IDisposeOnExit {
     }, {})
   }
 
-  async renderElement(contentId, args, eventDestination: IO.EventDestination) {
+  async renderElement(contentId: string, args, eventDestination: IO.EventDestination) {
     const { botId, channel } = eventDestination
     contentId = contentId.replace(/^#?/i, '')
-    let contentTypeRenderer
+    let contentTypeRenderer: ContentType
+
+    const translateFormData = async (formData: object): Promise<object> => {
+      const defaultLang = (await this.configProvider.getBotConfig(eventDestination.botId)).defaultLanguage
+      const lang = _.get(args, 'event.state.user.language')
+
+      return this.getOriginalProps(formData, contentTypeRenderer, lang, defaultLang)
+    }
 
     if (contentId.startsWith('!')) {
       const content = await this.getContentElement(botId, contentId.substr(1)) // TODO handle errors
@@ -536,12 +616,7 @@ export class CMSService implements IDisposeOnExit {
       }
 
       contentTypeRenderer = this.getContentType(content.contentType)
-
-      const defaultLang = (await this.configProvider.getBotConfig(eventDestination.botId)).defaultLanguage
-      const lang = _.get(args, 'event.state.user.language')
-
-      const translated = await this.getOriginalProps(content.formData, contentTypeRenderer, lang, defaultLang)
-      content.formData = translated
+      content.formData = await translateFormData(content.formData)
 
       _.set(content, 'formData', renderRecursive(content.formData, args))
 
@@ -557,8 +632,14 @@ export class CMSService implements IDisposeOnExit {
         ...args,
         ...content.formData
       }
+    } else if (contentId.startsWith('@')) {
+      contentTypeRenderer = this.getContentType(contentId.substr(1))
+      args = {
+        ...args,
+        ...(await translateFormData(args))
+      }
     } else {
-      contentTypeRenderer = await this.getContentType(contentId)
+      contentTypeRenderer = this.getContentType(contentId)
       if (args.text) {
         args = {
           ...args,
@@ -567,9 +648,9 @@ export class CMSService implements IDisposeOnExit {
       }
     }
 
-    const additionnalData = { BOT_URL: process.EXTERNAL_URL }
+    const additionalData = { BOT_URL: process.EXTERNAL_URL }
 
-    let payloads = await contentTypeRenderer.renderElement({ ...additionnalData, ...args }, channel)
+    let payloads = contentTypeRenderer.renderElement({ ...additionalData, ...args }, channel)
     if (!_.isArray(payloads)) {
       payloads = [payloads]
     }
@@ -619,5 +700,13 @@ export class CMSService implements IDisposeOnExit {
       id: elementId,
       contentType: contentTypeId
     })
+  }
+
+  /**
+   * Important! Do not use directly. Needs to be broadcasted.
+   */
+  private async local__invalidateForBot(botId: string): Promise<void> {
+    await this.clearElementsFromCache(botId)
+    await this.loadElementsForBot(botId)
   }
 }

@@ -1,7 +1,5 @@
 import * as sdk from 'botpress/sdk'
 
-import { Transition } from './typings'
-
 const generateFlow = async (data: any, metadata: sdk.FlowGeneratorMetadata): Promise<sdk.FlowGenerationResult> => {
   return {
     transitions: createTransitions(),
@@ -15,7 +13,7 @@ const generateFlow = async (data: any, metadata: sdk.FlowGeneratorMetadata): Pro
   }
 }
 
-const createTransitions = (): Transition[] => {
+const createTransitions = (): sdk.NodeTransition[] => {
   return [
     { caption: 'On extracted', condition: 'temp.extracted == "true"', node: '' },
     { caption: 'On not found', condition: 'temp.notExtracted == "true"', node: '' },
@@ -27,7 +25,7 @@ const createNodes = data => {
   const slotExtractOnReceive = [
     {
       type: sdk.NodeActionType.RunAction,
-      name: `basic-skills/slot_fill {"slotName":"${data.slotName}","entities":"${data.entities}"}`
+      name: `basic-skills/slot_fill {"slotName":"${data.slotName}","entities":"${data.entities}", "turnExpiry":${data.turnExpiry}}`
     }
   ]
 
@@ -50,7 +48,7 @@ const createNodes = data => {
       onReceive: slotExtractOnReceive,
       next: [
         {
-          condition: `session.extractedSlots.${data.slotName} && (temp.valid === undefined || temp.valid == "true")`,
+          condition: `session.slots['${data.slotName}'] && (temp.valid === undefined || temp.valid == "true")`,
           node: 'extracted'
         },
         {
@@ -90,7 +88,7 @@ const createNodes = data => {
       onReceive: slotExtractOnReceive,
       next: [
         {
-          condition: `session.extractedSlots.${data.slotName} && (temp.valid === undefined || temp.valid == "true")`,
+          condition: `session.slots['${data.slotName}'] && (temp.valid === undefined || temp.valid == "true")`,
           node: 'extracted'
         },
         {
@@ -98,7 +96,7 @@ const createNodes = data => {
           node: '#'
         },
         {
-          condition: 'session.extractedSlots.notFound > 0',
+          condition: 'session.slots.notFound > 0',
           node: 'not-extracted'
         },
         {
@@ -118,7 +116,7 @@ const createNodes = data => {
       onReceive: undefined,
       next: [
         {
-          condition: `session.extractedSlots.${data.slotName} !== undefined`,
+          condition: `session.slots['${data.slotName}'] !== undefined`,
           node: 'already-extracted'
         },
         {

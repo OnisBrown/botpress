@@ -1,10 +1,55 @@
 /**
  * This is the official Botpress SDK, designed to help our fellow developers to create wonderful modules and
- * extend the world's best chatbot functionnality to make it even better! Your module will receives an instance of
+ * extend the world's best chatbot functionality to make it even better! Your module will receives an instance of
  * this SDK (Yes, all those beautiful features!) to kick start your development. Missing something important?
  * Please let us know in our official Github Repo!
  */
 declare module 'botpress/sdk' {
+  import Knex from 'knex'
+  import { Router, Request, Response, NextFunction } from 'express'
+
+  export interface KnexExtension {
+    isLite: boolean
+    location: string
+    createTableIfNotExists(tableName: string, cb: Knex.KnexCallback): Promise<boolean>
+    date: Knex.Date
+    bool: Knex.Bool
+    json: Knex.Json
+    binary: Knex.Binary
+    insertAndRetrieve<T>(
+      tableName: string,
+      data: {},
+      returnColumns?: string | string[],
+      idColumnName?: string,
+      trx?: Knex.Transaction
+    ): Promise<T>
+  }
+
+  export interface Incident {
+    id: string
+    ruleName: string
+    hostName: string
+    startTime: Date
+    endTime?: Date
+    triggerValue: number
+  }
+
+  export type StrategyUser = {
+    id?: number
+    password?: string
+    salt?: string
+  } & UserInfo
+
+  export interface UserInfo {
+    email: string
+    strategy: string
+    createdOn?: string
+    updatedOn?: string
+    attributes: any
+  }
+
+  export type KnexExtended = Knex & KnexExtension
+
   /**
    * Returns the current version of Botpress
    */
@@ -15,7 +60,7 @@ declare module 'botpress/sdk' {
    * When developing modules, you can use this to create tables and manage data
    * @example bp.database('srv_channel_users').insert()
    */
-  export const database: any
+  export const database: KnexExtended
 
   /**
    * The logger instance is automatically scoped to the calling module
@@ -25,17 +70,19 @@ declare module 'botpress/sdk' {
 
   export interface LoggerEntry {
     botId?: string
+    hostname?: string
     level: string
     scope: string
     message: string
     metadata: any
-    timestamp: string
+    timestamp: Date
   }
 
   export enum LoggerLevel {
     Info = 'info',
     Warn = 'warn',
     Error = 'error',
+    Critical = 'critical',
     Debug = 'debug'
   }
 
@@ -45,11 +92,16 @@ declare module 'botpress/sdk' {
     DEBUG = 2
   }
 
+  export interface LoggerListener {
+    (level: LogLevel, message: string, args: any): void
+  }
+
   export interface Logger {
     forBot(botId: string): this
     attachError(error: Error): this
     persist(shouldPersist: boolean): this
     level(level: LogLevel): this
+    noEmit(): this
 
     /**
      * Sets the level that will be required at runtime to
@@ -65,6 +117,7 @@ declare module 'botpress/sdk' {
     info(message: string, metadata?: any): void
     warn(message: string, metadata?: any): void
     error(message: string, metadata?: any): void
+    critical(message: string, metadata?: any): void
   }
 
   export type ElementChangedAction = 'create' | 'update' | 'delete'
@@ -80,18 +133,38 @@ declare module 'botpress/sdk' {
     skills?: Skill[]
     /** An array of available bot templates when creating a new bot */
     botTemplates?: BotTemplate[]
+    translations?: { [lang: string]: object }
+    /** List of new conditions that the module can register */
+    dialogConditions?: Condition[]
     /** Called once the core is initialized. Usually for middlewares / database init */
-    onServerStarted: (bp: typeof import('botpress/sdk')) => void
+    onServerStarted?: (bp: typeof import('botpress/sdk')) => Promise<void>
     /** This is called once all modules are initialized, usually for routing and logic */
-    onServerReady: (bp: typeof import('botpress/sdk')) => void
-    onBotMount?: (bp: typeof import('botpress/sdk'), botId: string) => void
-    onBotUnmount?: (bp: typeof import('botpress/sdk'), botId: string) => void
+    onServerReady?: (bp: typeof import('botpress/sdk')) => Promise<void>
+    onBotMount?: (bp: typeof import('botpress/sdk'), botId: string) => Promise<void>
+    onBotUnmount?: (bp: typeof import('botpress/sdk'), botId: string) => Promise<void>
     /**
      * Called when the module is unloaded, before being reloaded
      * onBotUnmount is called for each bots before this one is called
      */
-    onModuleUnmount?: (bp: typeof import('botpress/sdk')) => void
-    onFlowChanged?: (bp: typeof import('botpress/sdk'), botId: string, flow: Flow) => void
+    onModuleUnmount?: (bp: typeof import('botpress/sdk')) => Promise<void>
+    /**
+     * Called when a topic is being changed.
+     * If oldName is not set, then the topic `newName` is being created
+     * If newName is not set, then the topic `oldName` is being deleted
+     */
+    onTopicChanged?: (
+      bp: typeof import('botpress/sdk'),
+      botId: string,
+      oldName?: string,
+      newName?: string
+    ) => Promise<void>
+    onFlowChanged?: (bp: typeof import('botpress/sdk'), botId: string, flow: Flow) => Promise<void>
+    onFlowRenamed?: (
+      bp: typeof import('botpress/sdk'),
+      botId: string,
+      previousFlowName: string,
+      newFlowName: string
+    ) => Promise<void>
     /**
      * This method is called whenever a content element is created, updated or deleted.
      * Modules can act on these events if they need to update references, for example.
@@ -102,7 +175,7 @@ declare module 'botpress/sdk' {
       action: ElementChangedAction,
       element: ContentElement,
       oldElement?: ContentElement
-    ) => void
+    ) => Promise<void>
   }
 
   /**
@@ -132,9 +205,12 @@ declare module 'botpress/sdk' {
     noInterface?: boolean
     /** An icon to display next to the name, if none is specified, it will receive a default one */
     menuIcon?: string
-    /** The name displayed on the menu */
+    /**
+     * The name displayed on the menu
+     * @deprecated Set the property "fullName" in the translations file for the desired language
+     */
     menuText?: string
-    /** Optionnaly specify a link to your page or github repo */
+    /** Optionally specify a link to your page or github repo */
     homepage?: string
     /** Whether or not the module is likely to change */
     experimental?: boolean
@@ -149,6 +225,8 @@ declare module 'botpress/sdk' {
     id: string
     /** The name that will be displayed in the toolbar for the skill */
     name: string
+    /** An icon to identify the skill */
+    icon?: string | any
     /** Name of the parent module. This field is filled automatically when they are loaded */
     readonly moduleName?: string
     /**
@@ -230,20 +308,100 @@ declare module 'botpress/sdk' {
 
       export interface ModelConstructor {
         new (): Model
+        new (lazy: boolean, keepInMemory: boolean, queryOnly: boolean): Model
       }
 
       export const Model: ModelConstructor
     }
 
+    export namespace KMeans {
+      export interface KMeansOptions {
+        maxIterations?: number
+        tolerance?: number
+        withIterations?: boolean
+        distanceFunction?: DistanceFunction
+        seed?: number
+        initialization?: 'random' | 'kmeans++' | 'mostDistant' | number[][]
+      }
+
+      export interface Centroid {
+        centroid: number[]
+        error: number
+        size: number
+      }
+
+      // TODO convert this to class we build the source of ml-kmeans
+      export interface KmeansResult {
+        // constructor(
+        //   clusters: number[],
+        //   centroids: Centroid[],
+        //   converged: boolean,
+        //   iterations: number,
+        //   distance: DistanceFunction
+        // )
+        clusters: number[]
+        centroids: Centroid[]
+        iterations: number
+        nearest: (data: DataPoint[]) => number[]
+      }
+
+      export type DataPoint = number[]
+
+      export type DistanceFunction = (point0: DataPoint, point1: DataPoint) => number
+
+      export const kmeans: (data: DataPoint[], K: number, options: KMeansOptions) => KmeansResult
+    }
+
+    export namespace SVM {
+      export interface SVMOptions {
+        classifier: 'C_SVC' | 'NU_SVC' | 'ONE_CLASS' | 'EPSILON_SVR' | 'NU_SVR'
+        kernel: 'LINEAR' | 'POLY' | 'RBF' | 'SIGMOID'
+        c?: number | number[]
+        gamma?: number | number[]
+        probability?: boolean
+        reduce?: boolean
+      }
+
+      export type DataPoint = {
+        label: string
+        coordinates: number[]
+      }
+
+      export type Prediction = {
+        label: string
+        confidence: number
+      }
+
+      export interface TrainProgressCallback {
+        (progress: number): void
+      }
+
+      export class Trainer {
+        constructor()
+        train(points: DataPoint[], options?: Partial<SVMOptions>, callback?: TrainProgressCallback): Promise<string>
+        isTrained(): boolean
+      }
+
+      export class Predictor {
+        constructor(model: string)
+        predict(coordinates: number[]): Promise<Prediction[]>
+        isLoaded(): boolean
+        getLabels(): string[]
+      }
+    }
+
     export namespace Strings {
       /**
-       * Returns the levenshtein distance between two strings
+       * Returns the levenshtein similarity between two strings
+       * sim(a, b) = (|a| - dist(a, b)) / |a| where |a| < |b|
+       * sim(a, b) ∈ [0, 1]
        * @returns the proximity between 0 and 1, where 1 is very close
        */
       export const computeLevenshteinDistance: (a: string, b: string) => number
 
       /**
-       * Returns the jaro-winkler distance between two strings
+       * Returns the jaro-winkler similarity between two strings
+       * sim(a, b) = 1 - dist(a, b)
        * @returns the proximity between 0 and 1, where 1 is very close
        */
       export const computeJaroWinklerDistance: (a: string, b: string, options: { caseSensitive: boolean }) => number
@@ -253,6 +411,7 @@ declare module 'botpress/sdk' {
       export interface Tagger {
         tag(xseq: Array<string[]>): { probability: number; result: string[] }
         open(model_filename: string): boolean
+        marginal(xseq: Array<string[]>): { [label: string]: number }[]
       }
 
       export interface TrainerOptions {
@@ -263,22 +422,34 @@ declare module 'botpress/sdk' {
         (message: string): void
       }
 
+      interface DataPoint {
+        features: Array<string[]>
+        labels: string[]
+      }
+
       export interface Trainer {
-        append(xseq: Array<string[]>, yseq: string[]): void
-        train(model_filename: string): void
-        set_params(options: TrainerOptions): void
-        set_callback(callback: TrainerCallback): void
+        train(elements: DataPoint[], options: TrainerOptions): Promise<string>
       }
 
       export const createTrainer: () => Trainer
       export const createTagger: () => Tagger
+    }
+
+    export namespace SentencePiece {
+      export interface Processor {
+        loadModel: (modelPath: string) => void
+        encode: (inputText: string) => string[]
+        decode: (pieces: string[]) => string
+      }
+
+      export const createProcessor: () => Processor
     }
   }
 
   export namespace NLU {
     export type EntityType = 'system' | 'pattern' | 'list'
 
-    export interface EntityDefOccurence {
+    export interface EntityDefOccurrence {
       name: string
       synonyms: string[]
     }
@@ -288,20 +459,24 @@ declare module 'botpress/sdk' {
       name: string
       type: EntityType
       sensitive?: boolean
-      fuzzy?: boolean
-      occurences?: EntityDefOccurence[]
+      matchCase?: boolean
+      examples?: string[]
+      fuzzy?: number
+      occurrences?: EntityDefOccurrence[]
       pattern?: string
     }
 
     export interface SlotDefinition {
       name: string
       entities: string[]
-      entity?: string
+      color: number
     }
 
     export interface IntentDefinition {
       name: string
-      utterances: string[]
+      utterances: {
+        [lang: string]: string[]
+      }
       filename: string
       slots: SlotDefinition[]
       contexts: string[]
@@ -339,13 +514,74 @@ declare module 'botpress/sdk' {
     export interface Slot {
       name: string
       value: any
+      source: any
       entity: Entity
+      confidence: number
+      start: number
+      end: number
     }
 
-    export interface SlotsCollection {
-      [key: string]: Slot | Slot[]
+    export type SlotCollection = Dic<Slot>
+
+    export interface Predictions {
+      [context: string]: {
+        confidence: number
+        intents: { label: string; confidence: number }[]
+      }
     }
   }
+
+  export namespace NDU {
+    interface GenericTrigger {
+      conditions: DecisionTriggerCondition[]
+    }
+
+    export interface WorkflowTrigger extends GenericTrigger {
+      type: 'workflow'
+      workflowId: string
+      nodeId: string
+      /** When true, the user must be inside the specified workflow for the trigger to be active */
+      activeWorkflow?: boolean
+    }
+
+    export interface FaqTrigger extends GenericTrigger {
+      type: 'faq'
+      faqId: string
+      topicName: string
+    }
+
+    export interface NodeTrigger extends GenericTrigger {
+      type: 'node'
+      workflowId: string
+      nodeId: string
+    }
+
+    export type Trigger = NodeTrigger | FaqTrigger | WorkflowTrigger
+
+    export interface DialogUnderstanding {
+      triggers: {
+        [triggerId: string]: {
+          result: Dic<number>
+          trigger: Trigger
+        }
+      }
+      actions: Actions[]
+      predictions: { [key: string]: { triggerId: string; confidence: number } }
+    }
+
+    export interface Actions {
+      action: 'send' | 'startWorkflow' | 'redirect' | 'continue' | 'goToNode'
+      data?: SendContent | FlowRedirect
+    }
+
+    export interface FlowRedirect {
+      flow: string
+      node: string
+    }
+
+    export type SendContent = Pick<IO.Suggestion, 'confidence' | 'payloads' | 'source' | 'sourceDetails'>
+  }
+
   export namespace IO {
     export type EventDirection = 'incoming' | 'outgoing'
     export namespace WellKnownFlags {
@@ -397,10 +633,12 @@ declare module 'botpress/sdk' {
       /** The date the event was created */
       readonly createdOn: Date
       readonly credentials?: any
+      /** When false, some properties used by the debugger are stripped from the event before storing */
+      debugger?: boolean
       /**
        * Check if the event has a specific flag
        * @param flag The flag symbol to verify. {@link IO.WellKnownFlags} to know more about existing flags
-       * @returns Return wheter or not the event has the flag
+       * @returns Return whether or not the event has the flag
        * @example event.hasFlag(bp.IO.WellKnownFlags.SKIP_DIALOG_ENGINE)
        */
       hasFlag(flag: symbol): boolean
@@ -428,26 +666,34 @@ declare module 'botpress/sdk' {
     }
 
     export interface EventUnderstanding {
-      readonly intent: NLU.Intent
-      readonly intents: NLU.Intent[]
+      intent: NLU.Intent
+      /** Predicted intents needs disambiguation */
+      readonly ambiguous: boolean
+      intents: NLU.Intent[]
+      /** The language used for prediction. Will be equal to detected language when its part of supported languages, falls back to default language otherwise */
       readonly language: string
+      /** Language detected from users input. */
+      readonly detectedLanguage: string
       readonly entities: NLU.Entity[]
-      readonly slots: NLU.SlotsCollection
+      readonly slots: NLU.SlotCollection
       readonly errored: boolean
       readonly includedContexts: string[]
+      readonly predictions?: NLU.Predictions
+      readonly ms: number
     }
 
     export interface IncomingEvent extends Event {
       /** Array of possible suggestions that the Decision Engine can take  */
       readonly suggestions?: Suggestion[]
       /** Contains data related to the state of the event */
-      readonly state: EventState
+      state: EventState
       /** Holds NLU extraction results (when the event is natural language) */
       readonly nlu?: EventUnderstanding
       /** The final decision that the Decision Engine took */
       readonly decision?: Suggestion
       /* HITL module has possibility to pause conversation */
       readonly isPause?: boolean
+      readonly ndu?: NDU.DialogUnderstanding
     }
 
     export interface OutgoingEvent extends Event {
@@ -464,7 +710,7 @@ declare module 'botpress/sdk' {
       source: string
       /** More specific details from the source of the suggestion, e.g. the name of the QnA */
       sourceDetails?: string
-      /** The Decision Engine's decison about this suggestion */
+      /** The Decision Engine's decision about this suggestion */
       decision: {
         status: 'dropped' | 'elected'
         reason: string
@@ -477,7 +723,7 @@ declare module 'botpress/sdk' {
      */
     export interface EventState {
       /** Data saved as user attributes; retention policies in Botpress global config applies  */
-      user: User
+      user: any
       /** Data is kept for the active session. Timeout configurable in the global config file */
       session: CurrentSession
       /** Data saved to this variable will be remembered until the end of the flow */
@@ -490,6 +736,21 @@ declare module 'botpress/sdk' {
       bot: any
       /** Used internally by Botpress to keep the user's current location and upcoming instructions */
       context: DialogContext
+      /**
+       * EXPERIMENTAL
+       * This includes all the flow/nodes which were traversed for the current event
+       */
+      __stacktrace: JumpPoint[]
+      /** Contains details about an error that occurred while processing the event */
+      __error?: EventError
+    }
+
+    export interface EventError {
+      type: 'action-execution' | 'dialog-transition'
+      stacktrace?: string
+      actionName?: string
+      actionArgs?: any
+      destination?: string
     }
 
     export interface JumpPoint {
@@ -497,6 +758,8 @@ declare module 'botpress/sdk' {
       flow: string
       /** The name of the previous node to return to when we exit a subflow */
       node: string
+      /** When a jump point is used, it will be removed from the list on the next transition */
+      used?: boolean
     }
 
     export interface DialogContext {
@@ -522,7 +785,32 @@ declare module 'botpress/sdk' {
     export interface CurrentSession {
       lastMessages: DialogTurnHistory[]
       nluContexts?: NluContext[]
+      nduContext?: NduContext
+      lastWorkflows: WorkflowHistory[]
+      // Prevent warnings when using the code editor with custom properties
+      [anyKey: string]: any
     }
+
+    export interface WorkflowHistory {
+      workflow: string
+      eventId: string
+      success?: boolean
+      active?: boolean
+    }
+
+    export type StoredEvent = {
+      /** This ID is automatically generated when inserted in the DB  */
+      readonly id?: number
+      direction: EventDirection
+      /** Outgoing events will have the incoming event ID, if they were triggered by one */
+      incomingEventId?: string
+      sessionId: string
+      workflowId?: string
+      feedback?: number
+      success?: boolean
+      event: IO.Event
+      createdOn: any
+    } & EventDestination
 
     /**
      * They represent the contexts that will be used by the NLU Engine for the next messages for that chat session.
@@ -536,6 +824,14 @@ declare module 'botpress/sdk' {
       context: string
       /** Represent the number of turns before the context is removed from the session */
       ttl: number
+    }
+
+    export interface NduContext {
+      last_turn_action_name: string
+      last_turn_highest_ranking_trigger_id: string
+      last_turn_node_id: string
+      last_turn_ts: number
+      last_topic: string
     }
 
     export interface DialogTurnHistory {
@@ -614,25 +910,50 @@ declare module 'botpress/sdk' {
     redirectUrl?: string
   }
 
+  export interface UpsertOptions {
+    /** Whether or not to record a revision @default true */
+    recordRevision?: boolean
+    /** When enabled, files changed on the database are synced locally so they can be used locally (eg: require in actions) @default false */
+    syncDbToDisk?: boolean
+    /** This is only applicable for bot-scoped ghost. When true, the lock status of the bot is ignored. @default false */
+    ignoreLock?: boolean
+  }
+
+  export interface DirectoryListingOptions {
+    excludes?: string | string[]
+    includeDotFiles?: boolean
+    sortOrder?: SortOrder & { column: 'filePath' | 'modifiedOn' }
+  }
+
   export interface ScopedGhostService {
     /**
      * Insert or Update the file at the specified location
      * @param rootFolder - Folder relative to the scoped parent
      * @param file - The name of the file
+     * @param content - The content of the file
      */
-    upsertFile(rootFolder: string, file: string, content: string | Buffer): Promise<void>
+    upsertFile(rootFolder: string, file: string, content: string | Buffer, options?: UpsertOptions): Promise<void>
     readFileAsBuffer(rootFolder: string, file: string): Promise<Buffer>
     readFileAsString(rootFolder: string, file: string): Promise<string>
     readFileAsObject<T>(rootFolder: string, file: string): Promise<T>
+    renameFile(rootFolder: string, fromName: string, toName: string): Promise<void>
     deleteFile(rootFolder: string, file: string): Promise<void>
     /**
-     * List all the files matching the ending pattern in the folder
+     * List all the files matching the ending pattern in the folder.
+     * DEPRECATE WARNING: exclude and includedDotFiles must be defined in options in future versions
      * @example bp.ghost.forBot('welcome-bot').directoryListing('./questions', '*.json')
      * @param rootFolder - Folder relative to the scoped parent
      * @param fileEndingPattern - The pattern to match. Don't forget to include wildcards!
-     * @param exclude - The pattern to match excluded files.
+     * @param @deprecated exclude - The pattern to match excluded files.
+     * @param @deprecated includeDotFiles - Whether or not to include files starting with a dot (normally disabled files)
      */
-    directoryListing(rootFolder: string, fileEndingPattern: string, exclude?: string | string[]): Promise<string[]>
+    directoryListing(
+      rootFolder: string,
+      fileEndingPattern: string,
+      exclude?: string | string[],
+      includeDotFiles?: boolean,
+      options?: DirectoryListingOptions
+    ): Promise<string[]>
     /**
      * Starts listening on all file changes (deletion, inserts and updates)
      * `callback` will be called for every change
@@ -640,6 +961,45 @@ declare module 'botpress/sdk' {
      */
     onFileChanged(callback: (filePath: string) => void): ListenHandle
     fileExists(rootFolder: string, file: string): Promise<boolean>
+  }
+
+  export interface KvsService {
+    /**
+     * Returns the specified key as JSON object
+     * @example bp.kvs.forBot('bot123').get('hello/whatsup')
+     */
+    get(key: string, path?: string): Promise<any>
+
+    /**
+     * Saves the specified key as JSON object
+     * @example bp.kvs.forBot('bot123').set('hello/whatsup', { msg: 'i love you' })
+     * @param expiry The key will expire in X (eg: 10m, 1d, 30 days) - refer to https://www.npmjs.com/package/ms for options
+     */
+    set(key: string, value: any, path?: string, expiry?: string): Promise<void>
+
+    /**
+     * Deletes the specified key
+     * @example bp.kvs.forBot('bot123').delete('hello/whatsup')
+     */
+    delete(key: string): Promise<void>
+
+    /**
+     * Whether or not the specified key exists
+     * @example bp.kvs.forBot('bot123').exists('hello/whatsup')
+     */
+    exists(key: string): Promise<boolean>
+    /**
+     * @deprecated Use bp.kvs.forBot().set() and set an expiry as the last parameter
+     */
+    setStorageWithExpiry(key: string, value, expiry?: string)
+    /**
+     * @deprecated Use bp.kvs.forBot().get() which handles expiry automatically
+     */
+    getStorageWithExpiry(key: string)
+    getConversationStorageKey(sessionId: string, variable: string): string
+    getUserStorageKey(userId: string, variable: string): string
+    getGlobalStorageKey(variable: string): string
+    removeStorageKeysStartingWith(key): Promise<void>
   }
 
   export interface ListenHandle {
@@ -665,12 +1025,14 @@ declare module 'botpress/sdk' {
       /** Defines the list of content types supported by the bot */
       contentTypes: string[]
     }
+    converse?: ConverseConfig
     dialog?: DialogConfig
     logs?: LogsConfig
     defaultLanguage: string
     languages: string[]
     locked: boolean
     pipeline_status: BotPipelineStatus
+    oneflow?: boolean
   }
 
   export type Pipeline = Stage[]
@@ -696,7 +1058,13 @@ declare module 'botpress/sdk' {
       status: string
       requested_by: string
       id: string
+      approvals?: StageRequestApprovers[]
     }
+  }
+
+  export interface StageRequestApprovers {
+    email: string
+    strategy: string
   }
 
   export interface BotDetails {
@@ -705,15 +1073,38 @@ declare module 'botpress/sdk' {
     termsConditions?: string
     privacyPolicy?: string
     emailAddress?: string
+    avatarUrl?: string
+    coverPictureUrl?: string
   }
 
   export interface LogsConfig {
     expiration: string
   }
 
+  /**
+   * Configuration definition of Dialog Sessions
+   */
   export interface DialogConfig {
+    /** The interval until a session context expires */
     timeoutInterval: string
+    /** The interval until a session expires */
     sessionTimeoutInterval: string
+  }
+
+  /**
+   * Configuration file definition for the Converse API
+   */
+  export type ConverseConfig = {
+    /**
+     * The timeout of the converse API requests
+     * @default 5s
+     */
+    timeout: string
+    /**
+     * The text limitation of the converse API requests
+     * @default 360
+     */
+    maxMessageLength: number
   }
 
   /**
@@ -777,6 +1168,9 @@ declare module 'botpress/sdk' {
    */
   export interface Flow {
     name: string
+    /** Friendly name to display in the flow view */
+    label?: string
+    description?: string
     location?: string
     version?: string
     /** This is the home node. The user will be directed there when he enters the flow */
@@ -791,6 +1185,73 @@ declare module 'botpress/sdk' {
     timeoutNode?: string
     type?: string
     timeout?: { name: string; flow: string; node: string }[]
+  }
+
+  export interface DecisionTriggerCondition {
+    id: string
+    params?: { [key: string]: any }
+  }
+
+  export interface Condition {
+    id: string
+    /** String displayed in the dropdown */
+    label: string
+    /** The description holds placeholders for param values so they can be displayed in the view */
+    description?: string
+    /** The definition of all parameters used by this condition */
+    params?: { [paramName: string]: ConditionParam }
+    /** In which order the conditions will be displayed in the dropdown menu. 0 is the first item */
+    displayOrder?: number
+    /** This callback url is called when the condition is deleted or pasted in the flow */
+    callback?: string
+    /** The editor will use the custom component to provide the requested parameters */
+    editor?: {
+      module: string
+      component: string
+    }
+    evaluate: (event: IO.IncomingEvent, params: any) => number
+  }
+
+  export interface ConditionParam {
+    label: string
+    /** Each type provides a different kind of editor */
+    type: 'string' | 'number' | 'boolean' | 'list' | 'radio' | 'array' | 'content'
+    /** Different components can be used to display certain types (eg: boolean/list) */
+    subType?: 'switch' | 'radio'
+    required?: boolean
+    defaultValue?: any
+    /** Number of rows (for types which supports it, ex: string, array) */
+    rows?: number
+    /** When type is list, this variable must be configured */
+    list?: ConditionListOptions
+  }
+
+  export interface ConditionListOptions {
+    /** List of options displayed in the dropdown menu */
+    items?: Option[]
+    /**Alternatively, set an endpoint where the list will be queried (eg: intents) */
+    endpoint?: string
+    /** The path to the list of elements (eg: language.available) */
+    path?: string
+    /** Name of the field which will be used as the value. Default to value */
+    valueField?: string
+    /** Friendly name displayed in the dropdown menu. Default to label */
+    labelField?: string
+  }
+
+  export interface Option {
+    value: string
+    label: string
+  }
+
+  export interface Topic {
+    name: string
+    description: string
+  }
+
+  export interface Library {
+    elementPath: string
+    elementId: string
   }
 
   /**
@@ -815,15 +1276,38 @@ declare module 'botpress/sdk' {
    */
   export type SkillFlow = Partial<Flow> & Pick<Required<Flow>, 'nodes'>
 
+  export type FlowNodeType =
+    | 'standard'
+    | 'skill-call'
+    | 'listen'
+    | 'say_something'
+    | 'success'
+    | 'failure'
+    | 'trigger'
+    | 'execute'
+    | 'router'
+    | 'action'
+
   export type FlowNode = {
     id?: string
     name: string
-    type?: any
+    type?: FlowNodeType
     timeoutNode?: string
     flow?: string
-  } & (NodeActions)
+    /** Used internally by the flow editor */
+    readonly lastModified?: Date
+  } & NodeActions
 
-  export type SkillFlowNode = Partial<FlowNode> & Pick<Required<FlowNode>, 'name'>
+  export type TriggerNode = FlowNode & {
+    conditions: DecisionTriggerCondition[]
+    activeWorkflow?: boolean
+  }
+
+  export type ListenNode = FlowNode & {
+    triggers: { conditions: DecisionTriggerCondition[] }[]
+  }
+
+  export type SkillFlowNode = Partial<ListenNode> & Pick<Required<ListenNode>, 'name'>
 
   /**
    * Node Transitions are all the possible outcomes when a user's interaction on a node is completed. The possible destinations
@@ -838,7 +1322,7 @@ declare module 'botpress/sdk' {
   export interface NodeTransition {
     /** The text to display instead of the condition in the flow editor */
     caption?: string
-    /** A JS expression thas is evaluated to determine if it should send the user to the specified node */
+    /** A JS expression that is evaluated to determine if it should send the user to the specified node */
     condition: string
     /** The destination node */
     node: string
@@ -856,6 +1340,12 @@ declare module 'botpress/sdk' {
     onReceive?: ActionBuilderProps[] | string[]
     /** An array of possible transitions once everything is completed */
     next?: NodeTransition[]
+    /** For node of type say_something, this contains the element to render */
+    content?: {
+      contentType: string
+      /** Every properties required by the content type, including translations */
+      formData: object
+    }
   }
 
   export interface ActionBuilderProps {
@@ -887,6 +1377,34 @@ declare module 'botpress/sdk' {
     }
   }
 
+  export interface MigrationResult {
+    success: boolean
+    message?: string
+  }
+
+  export interface ModuleMigration {
+    info: {
+      description: string
+      target?: 'core' | 'bot'
+      type: 'database' | 'config' | 'content'
+    }
+    up: (opts: ModuleMigrationOpts) => Promise<MigrationResult>
+    down?: (opts: ModuleMigrationOpts) => Promise<MigrationResult>
+  }
+
+  export interface ModuleMigrationOpts {
+    bp: typeof import('botpress/sdk')
+    metadata: MigrationMetadata
+    configProvider: any
+    database: any
+    inversify: any
+  }
+
+  /** These are additional information that Botpress may pass down to migrations (for ex: running bot-specific migration) */
+  export interface MigrationMetadata {
+    botId?: string
+  }
+
   /**
    * Simple interface to use when paging is required
    */
@@ -895,6 +1413,38 @@ declare module 'botpress/sdk' {
     start: number
     /** How many elements should be returned */
     count: number
+  }
+
+  /**
+   * All available rollout strategies (how users interact with bots of that workspace)
+   * An invite code is permanent, meaning that it will be consumed once and will not be necessary for that user in the future
+   *
+   * anonymous: Anyone can talk to bots
+   * anonymous-invite: Anyone with an invite code can talk to bots
+   * authenticated: Authenticated users will be automatically added to workspace as "chat user" (will then be "authorized")
+   * authenticated-invite: Authenticated users with an invite code will be added to workspace as "chat user" (will then be "authorized")
+   * authorized: Only authenticated users with an existing access to the workspace can talk to bots
+   */
+  export type RolloutStrategy =
+    | 'anonymous'
+    | 'anonymous-invite'
+    | 'authenticated'
+    | 'authenticated-invite'
+    | 'authorized'
+
+  export interface WorkspaceRollout {
+    rolloutStrategy: RolloutStrategy
+    inviteCode?: string
+    allowedUsages?: number
+  }
+
+  export interface AddWorkspaceUserOptions {
+    /** Select an existing custom role for that user. If role, asAdmin and asChatUser are undefined, then it will pick the default role */
+    role?: string
+    /** When enabled, user is added to the workspace as an admin (role is ignored) */
+    asAdmin?: boolean
+    /** When enabled, user is added as a chat user (role is ignored)  */
+    asChatUser?: boolean
   }
 
   ////////////////
@@ -912,6 +1462,7 @@ declare module 'botpress/sdk' {
     export function sendPayload(payload: RealTimePayload)
   }
 
+  // prettier-ignore
   export type RouterCondition = boolean | ((req: any) => boolean)
 
   /**
@@ -925,10 +1476,23 @@ declare module 'botpress/sdk' {
     checkAuthentication: RouterCondition
 
     /**
+     * When checkAuthentication is enabled, set this to true to enforce permissions based on the method.
+     * GET/OPTIONS requests requires READ permissions, while all other requires WRITE permissions
+     * @default true
+     */
+    checkMethodPermissions?: RouterCondition
+
+    /**
      * Parse the body as JSON when possible
      * @default true
      */
     enableJsonBodyParser?: RouterCondition
+
+    /**
+     * Only parses body which are urlencoded
+     * @default true
+     */
+    enableUrlEncoderBodyParser?: RouterCondition
   }
 
   /**
@@ -948,6 +1512,14 @@ declare module 'botpress/sdk' {
     filters?: Filter[]
   }
 
+  export type EventSearchParams = {
+    /** Returns the amount of elements from the starting position  */
+    from?: number
+    count?: number
+    /** An array of columns with direction to sort results */
+    sortOrder?: SortOrder[]
+  }
+
   export interface Filter {
     /** The name of the column to filter on */
     column: string
@@ -965,6 +1537,18 @@ declare module 'botpress/sdk' {
   export interface AxiosOptions {
     /** When true, it will return the local url instead of the external url  */
     localUrl: boolean
+  }
+
+  export interface RedisLock {
+    /** Free the lock so other nodes can request it */
+    unlock(): Promise<void>
+    /** Extend the duration of the lock for the node owning it */
+    extend(duration: number): Promise<void>
+  }
+
+  export interface FileContent {
+    name: string
+    content: string | Buffer
   }
 
   export namespace http {
@@ -988,7 +1572,7 @@ declare module 'botpress/sdk' {
 
     /**
      * Create a new router for a module. Once created, use them to register new endpoints. Routers created
-     * with this method are accessible via the url /mod/{routernName}
+     * with this method are accessible via the url /mod/{routerName}
      *
      * @example const router = bp.http.createRouterForBot('myModule')
      * @example router.get('/list', ...)
@@ -997,11 +1581,11 @@ declare module 'botpress/sdk' {
      * @param options - Additional options to apply to the router
      * @param router - The router
      */
-    export function createRouterForBot(routerName: string, options?: RouterOptions): any & RouterExtension
+    export function createRouterForBot(routerName: string, options?: RouterOptions): RouterExtension
 
     /**
      * This method is meant to unregister a router before unloading a module. It is meant to be used in a development environment.
-     * It could cause unpredictable behaviour in production
+     * It could cause unpredictable behavior in production
      * @param routerName The name of the router (must have been registered with createRouterForBot)
      */
     export function deleteRouterForBot(routerName: string)
@@ -1023,22 +1607,27 @@ declare module 'botpress/sdk' {
     /**
      * This Express middleware tries to decode the X-BP-ExternalAuth header and adds a credentials header in the request if it's valid.
      */
-    export function extractExternalToken(req: any, res: any, next: any): Promise<void>
+    export function extractExternalToken(req: Request, res: Response, next: NextFunction): Promise<void>
 
-    export interface RouterExtension {
-      getPublicPath(): Promise<string>
-    }
+    export function needPermission(
+      operation: string,
+      resource: string
+    ): (req: Request, res: Response, next: NextFunction) => Promise<void>
+
+    export function hasPermission(req: any, operation: string, resource: string, noAudit?: boolean): Promise<boolean>
+
+    export type RouterExtension = { getPublicPath(): Promise<string> } & Router
   }
 
   /**
    * Events is the base communication channel of the bot. Messages and payloads are a part of it,
-   * and it is the only way to receive or send informations. Each event goes through the whole middleware chain (incoming or outgoing)
+   * and it is the only way to receive or send information. Each event goes through the whole middleware chain (incoming or outgoing)
    * before being received by either the bot or the user.
    */
   export namespace events {
     /**
      * Register a new middleware globally. They are sorted based on their declared order each time a new one is registered.
-     * @param midddleware - The middleware definition to register
+     * @param middleware - The middleware definition to register
      */
     export function registerMiddleware(middleware: IO.MiddlewareDefinition): void
 
@@ -1049,7 +1638,7 @@ declare module 'botpress/sdk' {
      * Send an event through the incoming or outgoing middleware chain
      * @param event - The event to send
      */
-    export function sendEvent(event: IO.Event): void
+    export function sendEvent(event: IO.Event): Promise<void>
 
     /**
      * Reply easily to any received event. It accepts an array of payloads
@@ -1060,6 +1649,49 @@ declare module 'botpress/sdk' {
      * @param payloads - One or multiple payloads to send
      */
     export function replyToEvent(eventDestination: IO.EventDestination, payloads: any[], incomingEventId?: string): void
+
+    /**
+     * Return the state of the incoming queue. True if there are any events(messages)
+     * from the user waiting in the queue.
+     * @param event - Current event in the action context, used to identify the queue
+     */
+    export function isIncomingQueueEmpty(event: IO.Event): boolean
+
+    /**
+     * When Event Storage is enabled, you can use this API to query data about stored events. You can use multiple fields
+     * for your query, but at least one is required.
+     *
+     * @param fields - One or multiple fields to add to the search query
+     * @param searchParams - Additional parameters for the query, like ordering, number of rows, etc.
+     */
+    export function findEvents(
+      fields: Partial<IO.StoredEvent>,
+      searchParams?: EventSearchParams
+    ): Promise<IO.StoredEvent[]>
+
+    /**
+     * When Event Storage is enabled, you can use this API to update an event. You can use multiple fields
+     * for your query, but at least one is required.
+     *
+     * @param id - The ID of the event to update
+     * @param fields - Fields to update on the event
+     */
+    export function updateEvent(id: number, fields: Partial<IO.StoredEvent>): Promise<void>
+
+    /**
+     * Register the user feedback for a specific event. The type property is used to increment associated metrics
+     * @param incomingEventId - The ID of the first event of the conversation
+     * @param target - The ID of the user
+     * @param feedback Either 1 or -1
+     * @param type - For now, only supports qna & workflow
+     * @return true if feedback was successfully saved
+     */
+    export function saveUserFeedback(
+      incomingEventId: string,
+      target: string,
+      feedback: number,
+      type?: string
+    ): Promise<boolean>
   }
 
   export type GetOrCreateResult<T> = Promise<{
@@ -1071,7 +1703,7 @@ declare module 'botpress/sdk' {
     /**
      * Returns an existing user or create a new one with the specified keys
      */
-    export function getOrCreateUser(channel: string, userId: string): GetOrCreateResult<User>
+    export function getOrCreateUser(channel: string, userId: string, botId?: string): GetOrCreateResult<User>
 
     /**
      * Merge the specified attributes to the existing attributes of the user
@@ -1084,6 +1716,7 @@ declare module 'botpress/sdk' {
     export function setAttributes(channel: string, userId: string, attributes: any): Promise<void>
     export function getAllUsers(paging?: Paging): Promise<any>
     export function getUserCount(): Promise<any>
+    export function getAttributes(channel: string, userId: string): Promise<any>
   }
 
   /**
@@ -1093,7 +1726,7 @@ declare module 'botpress/sdk' {
   export type State = any
 
   /**
-   * The dialog engine is what processes conversations. It orchestrates the conversationnal flow logic.
+   * The dialog engine is what processes conversations. It orchestrates the conversational flow logic.
    */
   export namespace dialog {
     /**
@@ -1113,30 +1746,82 @@ declare module 'botpress/sdk' {
     export function deleteSession(sessionId: string): Promise<void>
 
     /**
-     * Jumps to a specific flow and optionaly a specific node. This is useful when the default flow behaviour needs to be bypassed.
+     * Jumps to a specific flow and optionally a specific node. This is useful when the default flow behavior needs to be bypassed.
      * @param sessionId The Id of the the current Dialog Session. If the session doesn't exists, it will be created with this Id.
      * @param event The event to be processed
      * @param flowName The name of the flow to jump to
-     * @param nodeName The name of the optionnal node to jump to.
+     * @param nodeName The name of the optional node to jump to.
      * The node will default to the starting node of the flow if this value is omitted.
      */
-    export function jumpTo(sessionId: string, event: IO.Event, flowName: string, nodeName?: string): Promise<void>
+    export function jumpTo(
+      sessionId: string,
+      event: IO.IncomingEvent,
+      flowName: string,
+      nodeName?: string
+    ): Promise<void>
+
+    /**
+     * Returns the list of conditions that can be used in an NLU Trigger node
+     */
+    export function getConditions(): Condition[]
   }
 
   export namespace config {
     export function getModuleConfig(moduleId: string): Promise<any>
 
     /**
-     * Returns the configuation values for the specified module and bot.
+     * Returns the configuration values for the specified module and bot.
      * @param moduleId
      * @param botId
+     * @param ignoreGlobal Enable this when you want only bot-specific configuration to be possible
      */
-    export function getModuleConfigForBot(moduleId: string, botId: string): Promise<any>
+    export function getModuleConfigForBot(moduleId: string, botId: string, ignoreGlobal?: boolean): Promise<any>
 
     /**
      * Returns the configuration options of Botpress
      */
     export function getBotpressConfig(): Promise<any>
+
+    /**
+     * Merges and saves a bot's config
+     * @param botId
+     * @param partialConfig
+     * @param ignoreLock
+     */
+    export function mergeBotConfig(botId: string, partialConfig: Partial<BotConfig>, ignoreLock?: boolean): Promise<any>
+  }
+
+  /**
+   * The distributed namespace uses Redis to distribute commands to every node
+   */
+  export namespace distributed {
+    /**
+     * When a single node must process data from a shared source, call this method to obtain an exclusive lock.
+     * You can then call lock.extend() to keep it longer, or lock.unlock() to release it
+     * @param resource Name of the resource to lock
+     * @param duration the initial duration
+     * @return undefined if another node already has obtained the lock
+     */
+    export function acquireLock(resource: string, duration: number): Promise<RedisLock | undefined>
+
+    /**
+     * Forcefully clears any trace of the lock from the redis store. It doesn't clear the lock from the node which had it.
+     * Ensure that a broadcasted job took care of cancelling it before.
+     * @param resource
+     * @return true if an existing lock was deleted
+     */
+    export function clearLock(resource: string): Promise<boolean>
+
+    /**
+     * This method returns a function that can then be called to broadcast the message to every node
+     * @param fn The job that will be executed on all nodes
+     * @param T The return type of the returned function
+     *
+     * @example const distributeToAll: Function = await bp.distributed.broadcast<void>(_localMethod)
+     * @example const _localMethod = (param1, param2): Promise<void> { }
+     * @example distributeToAll('send to all nodes', 'other info') // Every node will execute this method
+     */
+    export function broadcast<T>(fn: Function): Promise<Function>
   }
 
   /**
@@ -1144,21 +1829,56 @@ declare module 'botpress/sdk' {
    */
   export namespace kvs {
     /**
+     * Access the KVS Service for a specific bot. Check the {@link ScopedGhostService} for the operations available on the scoped element.
+     */
+    export function forBot(botId: string): KvsService
+    /**
+     * Access the KVS Service globally. Check the {@link ScopedGhostService} for the operations available on the scoped element.
+     */
+    export function global(): KvsService
+
+    /**
      * Returns the specified key as JSON object
      * @example bp.kvs.get('bot123', 'hello/whatsup')
+     * @deprecated will be removed, use global or forBot
      */
     export function get(botId: string, key: string, path?: string): Promise<any>
 
     /**
      * Saves the specified key as JSON object
      * @example bp.kvs.set('bot123', 'hello/whatsup', { msg: 'i love you' })
+     * @deprecated will be removed, use global or forBot
      */
-    export function set(botId: string, key: string, value: any, path?: string): Promise<void>
-    export function setStorageWithExpiry(botId: string, key: string, value, expiryInMs?: string)
+    export function set(botId: string, key: string, value: any, path?: string, expiry?: string): Promise<void>
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
+    export function setStorageWithExpiry(botId: string, key: string, value, expiry?: string)
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
     export function getStorageWithExpiry(botId: string, key: string)
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
     export function getConversationStorageKey(sessionId: string, variable: string): string
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
     export function getUserStorageKey(userId: string, variable: string): string
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
     export function getGlobalStorageKey(variable: string): string
+
+    /**
+     * @deprecated will be removed, use global or forBot
+     */
     export function removeStorageKeysStartingWith(key): Promise<void>
   }
 
@@ -1174,9 +1894,40 @@ declare module 'botpress/sdk' {
      * Allows to import directly an archive (tar.gz) in a new bot.
      * @param botId The ID of the new bot (or an existing one)
      * @param archive The buffer of the archive file
+     * @param workspaceId The workspace where the bot will be imported
      * @param allowOverwrite? If not set, it will throw an error if the folder exists. Otherwise, it will overwrite files already present
      */
-    export function importBot(botId: string, archive: Buffer, allowOverwrite?: boolean): Promise<void>
+    export function importBot(
+      botId: string,
+      archive: Buffer,
+      workspaceId: string,
+      allowOverwrite?: boolean
+    ): Promise<void>
+
+    export function getBotTemplate(moduleName: string, templateName: string): Promise<FileContent[]>
+  }
+
+  export namespace workspaces {
+    export function getBotWorkspaceId(botId: string): Promise<string>
+    export function addUserToWorkspace(
+      email: string,
+      strategy: string,
+      workspaceId: string,
+      options?: AddWorkspaceUserOptions
+    ): Promise<void>
+    /**
+     * Returns the rollout strategy of the requested workspace.
+     * If the workspace ID is unknown, it will be determined from the bot ID
+     * @param workspaceId
+     */
+    export function getWorkspaceRollout(workspaceId: string): Promise<WorkspaceRollout>
+    /**
+     * Consumes an invite code for the specified workspace.
+     * @param workspaceId
+     * @param inviteCode an invite code to compare to
+     * @returns boolean indicating if code was valid & enough usage were left
+     */
+    export function consumeInviteCode(workspaceId: string, inviteCode?: string): Promise<boolean>
   }
 
   export namespace notifications {
@@ -1188,11 +1939,18 @@ declare module 'botpress/sdk' {
      * Access the Ghost Service for a specific bot. Check the {@link ScopedGhostService} for the operations available on the scoped element.
      */
     export function forBot(botId: string): ScopedGhostService
-
+    /**
+     * Access the Ghost Service scoped at the root of all bots
+     */
+    export function forBots(): ScopedGhostService
     /**
      * Access the Ghost Service globally. Check the {@link ScopedGhostService} for the operations available on the scoped element.
      */
     export function forGlobal(): ScopedGhostService
+    /**
+     * Access the BPFS at the root of the data folder
+     */
+    export function forRoot(): ScopedGhostService
   }
 
   export namespace cms {
@@ -1274,12 +2032,24 @@ declare module 'botpress/sdk' {
 
     /**
      * Render a template using Mustache template rendering.
-     * Use recursive template rendering to extract nexted templates.
+     * Use recursive template rendering to extract nested templates.
      *
      * @param item TemplateItem to render
      * @param context Variables to use for the template rendering
      */
     export function renderTemplate(item: TemplateItem, context): TemplateItem
+  }
+
+  /**
+   * Utility security-related features offered to developers
+   * to create more secure extensions.
+   */
+  export namespace security {
+    /**
+     * Creates a message signature, which can be used as proof that the message was created on Botpress backend
+     * You can call this method twice to verify the authenticity of a message
+     */
+    export function getMessageSignature(message: string): Promise<string>
   }
 
   /**

@@ -1,7 +1,7 @@
 export interface Config {
   /**
-   * When true, actions in the global folder are also accessible
+   * When enabled, actions & hooks created by Botpress will also be available in the UI
    * @default false
    */
-  allowGlobal: boolean
+  includeBuiltin: boolean
 }

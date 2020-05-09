@@ -1,3 +1,4 @@
+import { DirectoryListingOptions } from 'botpress/sdk'
 import { forceForwardSlashes } from 'core/misc/utils'
 import { WrapErrorsWith } from 'errors'
 import fse from 'fs-extra'
@@ -7,11 +8,13 @@ import _ from 'lodash'
 import path from 'path'
 import { VError } from 'verror'
 
+import { BPError } from '../dialog/errors'
+
 import { FileRevision, StorageDriver } from '.'
 
 @injectable()
 export default class DiskStorageDriver implements StorageDriver {
-  resolvePath = p => path.resolve(process.PROJECT_LOCATION, p)
+  resolvePath = (p: string) => path.resolve(process.PROJECT_LOCATION, p)
 
   async upsertFile(filePath: string, content: string | Buffer): Promise<void>
   async upsertFile(filePath: string, content: string | Buffer, recordRevision: boolean = false): Promise<void> {
@@ -33,10 +36,18 @@ export default class DiskStorageDriver implements StorageDriver {
       return fse.readFile(this.resolvePath(filePath))
     } catch (e) {
       if (e.code === 'ENOENT') {
-        throw new Error(`[Disk Storage] File "${filePath}" not found`)
+        throw new BPError(`[Disk Storage] File "${filePath}" not found`, 'ENOENT')
       }
 
       throw new VError(e, `[Disk Storage] Error reading file "${filePath}"`)
+    }
+  }
+
+  async fileExists(filePath: string): Promise<boolean> {
+    try {
+      return fse.pathExists(this.resolvePath(filePath))
+    } catch (e) {
+      throw new VError(e, `[Disk Storage] Error deleting file "${filePath}"`)
     }
   }
 
@@ -56,7 +67,7 @@ export default class DiskStorageDriver implements StorageDriver {
 
   async deleteDir(dirPath: string): Promise<void> {
     try {
-      return fse.removeSync(this.resolvePath(dirPath))
+      return fse.remove(this.resolvePath(dirPath))
     } catch (e) {
       throw new VError(e, `[Disk Storage] Error deleting directory "${dirPath}"`)
     }
@@ -64,8 +75,10 @@ export default class DiskStorageDriver implements StorageDriver {
 
   async directoryListing(
     folder: string,
-    exclude?: string | string[],
-    includeDotFiles: boolean = false
+    options: DirectoryListingOptions = {
+      excludes: [],
+      includeDotFiles: false
+    }
   ): Promise<string[]> {
     try {
       await fse.access(this.resolvePath(folder), fse.constants.R_OK)
@@ -78,14 +91,35 @@ export default class DiskStorageDriver implements StorageDriver {
       throw new VError(e, `[Disk Storage] No read access to directory "${folder}"`)
     }
 
-    const options = { cwd: this.resolvePath(folder), dot: includeDotFiles }
-    if (exclude) {
-      options['ignore'] = exclude
+    const ghostIgnorePatterns = await this._getGhostIgnorePatterns(this.resolvePath('data/.ghostignore'))
+    const globOptions: glob.IOptions = {
+      cwd: this.resolvePath(folder),
+      dot: options.includeDotFiles
+    }
+
+    // options.excludes can either be a string or an array of strings or undefined
+    if (Array.isArray(options.excludes)) {
+      globOptions['ignore'] = [...options.excludes, ...ghostIgnorePatterns]
+    } else if (options.excludes) {
+      globOptions['ignore'] = [options.excludes, ...ghostIgnorePatterns]
+    } else {
+      globOptions['ignore'] = ghostIgnorePatterns
     }
 
     try {
-      const files = await Promise.fromCallback<string[]>(cb => glob('**/*.*', options, cb))
-      return files.map(filePath => forceForwardSlashes(filePath))
+      const files = await Promise.fromCallback<string[]>(cb => glob('**/*.*', globOptions, cb))
+      if (!options.sortOrder) {
+        return files.map(filePath => forceForwardSlashes(filePath))
+      }
+
+      const { column, desc } = options.sortOrder
+
+      const filesWithDate = await Promise.map(files, async filePath => ({
+        filePath,
+        modifiedOn: (await fse.stat(path.join(this.resolvePath(folder), filePath))).mtime
+      }))
+
+      return _.orderBy(filesWithDate, [column], [desc ? 'desc' : 'asc']).map(x => forceForwardSlashes(x.filePath))
     } catch (e) {
       return []
     }
@@ -99,18 +133,6 @@ export default class DiskStorageDriver implements StorageDriver {
     try {
       const content = await this.readFile(path.join(pathPrefix, 'revisions.json'))
       return JSON.parse(content.toString())
-    } catch (err) {
-      return []
-    }
-  }
-
-  async discoverTrackableFolders(baseDir: string): Promise<string[]> {
-    try {
-      const allFiles = await this.directoryListing(baseDir, undefined, true)
-      const allDirectories = this._getBaseDirectories(allFiles)
-      const noghostFiles = allFiles.filter(x => path.basename(x).toLowerCase() === '.noghost')
-      const noghostDirectories = this._getBaseDirectories(noghostFiles)
-      return _.without(allDirectories, ...noghostDirectories)
     } catch (err) {
       return []
     }
@@ -132,5 +154,13 @@ export default class DiskStorageDriver implements StorageDriver {
       .map(f => f.split('/')[0])
       .uniq()
       .value()
+  }
+
+  private async _getGhostIgnorePatterns(ghostIgnorePath: string): Promise<string[]> {
+    if (await fse.pathExists(ghostIgnorePath)) {
+      const ghostIgnoreFile = await fse.readFile(ghostIgnorePath)
+      return ghostIgnoreFile.toString().split(/\r?\n/gi)
+    }
+    return []
   }
 }

@@ -5,11 +5,10 @@ import _ from 'lodash'
 import classnames from 'classnames'
 import moment from 'moment'
 
-import PageHeader from '~/components/Layout/PageHeader'
-import ContentWrapper from '~/components/Layout/ContentWrapper'
 import { downloadBlob } from '~/util'
 
 import styles from './style.scss'
+import { lang } from 'botpress/shared'
 
 class LoggerView extends Component {
   state = {
@@ -98,10 +97,7 @@ class LoggerView extends Component {
     const canLoadMore = this.state.limit < 500 && this.state.hasMore
 
     return (
-      <ContentWrapper>
-        <PageHeader>
-          <span>Logs</span>
-        </PageHeader>
+      <div>
         <Panel className={styles.panel}>
           <Panel.Body>
             <form className="pull-left">
@@ -111,11 +107,11 @@ class LoggerView extends Component {
                 inline
                 onChange={this.toggleAutoRefresh}
               >
-                Auto-refresh
+                {lang.tr('studio.flow.logs.autoRefresh')}
               </Checkbox>
             </form>
             <div className="pull-right">
-              <Button onClick={this.downloadArchive}>Download log archive</Button>
+              <Button onClick={this.downloadArchive}>{lang.tr('studio.flow.logs.downloadArchives')}</Button>
             </div>
           </Panel.Body>
         </Panel>
@@ -124,12 +120,12 @@ class LoggerView extends Component {
             <ul className={styles.events}>{logs}</ul>
           </div>
           {canLoadMore && (
-            <div href="#" className={styles['logs-panel-footer']} onClick={this.loadMore}>
-              Load more
+            <div className={styles['logs-panel-footer']} onClick={this.loadMore}>
+              {lang.tr('studio.flow.logs.loadMore')}
             </div>
           )}
         </div>
-      </ContentWrapper>
+      </div>
     )
   }
 }

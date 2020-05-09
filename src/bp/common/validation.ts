@@ -1,6 +1,9 @@
 import Joi from 'joi'
 
+import { defaultPipelines } from './defaults'
+
 export const BOTID_REGEX = /^[A-Z0-9]+[A-Z0-9_-]{1,}[A-Z0-9]+$/i
+export const WORKSPACEID_REGEX = /[A-Z0-9-_\/]/i
 
 export const isValidBotId = (botId: string): boolean => BOTID_REGEX.test(botId)
 
@@ -15,7 +18,7 @@ export const BotCreationSchema = Joi.object().keys({
   // tslint:disable-next-line:no-null-keyword
   category: Joi.string().allow(null),
   description: Joi.string()
-    .max(250)
+    .max(500)
     .allow(''),
   pipeline_status: {
     current_stage: {
@@ -34,7 +37,7 @@ export const BotEditSchema = Joi.object().keys({
   // tslint:disable-next-line:no-null-keyword
   category: Joi.string().allow(null),
   description: Joi.string()
-    .max(250)
+    .max(500)
     .allow(''),
   disabled: Joi.bool(),
   private: Joi.bool(),
@@ -74,4 +77,32 @@ export const BotEditSchema = Joi.object().keys({
       .optional()
       .allow('')
   }
+})
+
+export const WorkspaceCreationSchema = Joi.object().keys({
+  id: Joi.string()
+    .regex(WORKSPACEID_REGEX)
+    .required(),
+  name: Joi.string()
+    .max(50)
+    .required(),
+  description: Joi.string()
+    .max(500)
+    .allow(''),
+  audience: Joi.string()
+    .valid(['internal', 'external'])
+    .default('external')
+    .required(),
+  pipelineId: Joi.string()
+    .valid(Object.keys(defaultPipelines))
+    .default('none')
+})
+
+export const PipelineSchema = Joi.array().items({
+  id: Joi.string().required(),
+  label: Joi.string().required(),
+  action: Joi.string().required(),
+  reviewers: Joi.array().items({ email: Joi.string(), strategy: Joi.string() }),
+  minimumApprovals: Joi.number(),
+  reviewSequence: Joi.string().valid(['serial', 'parallel'])
 })

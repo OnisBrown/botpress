@@ -6,8 +6,11 @@ const path = require('path')
 const CopyWebpackPlugin = require('copy-webpack-plugin')
 const HtmlWebpackPlugin = require('html-webpack-plugin')
 const CleanWebpackPlugin = require('clean-webpack-plugin')
-const UglifyJSPlugin = require('uglifyjs-webpack-plugin')
+const TerserPlugin = require('terser-webpack-plugin')
+const HardSourceWebpackPlugin = require('hard-source-webpack-plugin')
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer')
 const isProduction = process.env.NODE_ENV === 'production'
+const moment = require('moment')
 
 const webConfig = {
   cache: false,
@@ -18,24 +21,30 @@ const webConfig = {
     web: './src/web/index.jsx',
     lite: './src/web/lite.jsx'
   },
+  node: {
+    net: 'empty',
+    tls: 'empty',
+    dns: 'empty'
+  },
   output: {
     path: path.resolve(__dirname, './public/js'),
-    publicPath: '/assets/ui-studio/public/js/',
+    publicPath: 'assets/ui-studio/public/js/',
     filename: '[name].[chunkhash].js'
   },
   resolve: {
-    extensions: ['.js', '.jsx', '.css'],
+    extensions: ['.js', '.jsx', '.tsx', '.ts', '.css'],
     alias: {
       '~': path.resolve(__dirname, './src/web'),
       DOCS: path.resolve(__dirname, '../../../docs/guide/docs'),
-      common: path.resolve(__dirname, '../../../out/bp/common')
+      common: path.resolve(__dirname, '../../../out/bp/common'),
+      'botpress/shared': 'ui-shared',
+      'botpress/sdk': path.resolve(__dirname, '../sdk/botpress.d.ts')
     }
   },
   optimization: {
     minimizer: [
-      new UglifyJSPlugin({
-        sourceMap: true,
-        cache: true
+      new TerserPlugin({
+        sourceMap: true
       })
     ],
     splitChunks: {
@@ -101,6 +110,11 @@ const webConfig = {
   module: {
     rules: [
       {
+        test: /\.tsx?$/,
+        loader: 'ts-loader',
+        exclude: /node_modules/
+      },
+      {
         test: /\.md$/,
         use: [
           {
@@ -112,11 +126,24 @@ const webConfig = {
         test: /\.jsx?$/i,
         include: path.resolve(__dirname, 'src/web'),
         use: [
-          { loader: 'thread-loader' },
+          {
+            loader: 'thread-loader'
+          },
           {
             loader: 'babel-loader',
             options: {
-              presets: ['stage-3', ['env', { targets: { browsers: ['last 2 versions'] } }], 'react'],
+              presets: [
+                'stage-3',
+                [
+                  'env',
+                  {
+                    targets: {
+                      browsers: ['last 2 versions']
+                    }
+                  }
+                ],
+                'react'
+              ],
               plugins: ['transform-class-properties'],
               compact: true,
               babelrc: false,
@@ -128,7 +155,12 @@ const webConfig = {
       {
         test: /\.styl$/,
         use: [
-          { loader: 'style-loader' },
+          {
+            loader: 'style-loader'
+          },
+          {
+            loader: 'css-modules-typescript-loader'
+          },
           {
             loader: 'css-loader',
             options: {
@@ -137,24 +169,38 @@ const webConfig = {
               localIdentName: '[name]__[local]___[hash:base64:5]'
             }
           },
-          { loader: 'postcss-loader' },
-          { loader: 'stylus-loader' }
+          {
+            loader: 'postcss-loader'
+          },
+          {
+            loader: 'stylus-loader'
+          }
         ]
       },
       {
         test: /\.scss$/,
         use: [
-          { loader: 'style-loader' },
+          {
+            loader: 'style-loader'
+          },
+          {
+            loader: 'css-modules-typescript-loader'
+          },
           {
             loader: 'css-loader',
             options: {
               modules: true,
+              url: false,
               importLoaders: 1,
               localIdentName: '[name]__[local]___[hash:base64:5]'
             }
           },
-          { loader: 'postcss-loader' },
-          { loader: 'sass-loader' }
+          {
+            loader: 'postcss-loader'
+          },
+          {
+            loader: 'sass-loader'
+          }
         ]
       },
       {
@@ -163,10 +209,32 @@ const webConfig = {
       },
       {
         test: /\.woff|\.woff2|\.svg|.eot|\.ttf/,
-        use: [{ loader: 'file-loader', options: { name: '../fonts/[name].[ext]' } }]
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+              name: '../fonts/[name].[ext]'
+            }
+          }
+        ]
       }
     ]
   }
+}
+
+if (!isProduction) {
+  webConfig.plugins.push(
+    new HardSourceWebpackPlugin({
+      info: {
+        mode: 'test',
+        level: 'debug'
+      }
+    })
+  )
+}
+
+if (process.argv.find(x => x.toLowerCase() === '--analyze')) {
+  webConfig.plugins.push(new BundleAnalyzerPlugin())
 }
 
 const showNodeEnvWarning = () => {
@@ -183,7 +251,8 @@ const postProcess = (err, stats) => {
   if (err) {
     throw err
   }
-  console.log(chalk.grey(stats.toString('minimal')))
+
+  console.log(`[${moment().format('HH:mm:ss')}] Studio ${chalk.grey(stats.toString('minimal'))}`)
 }
 
 if (process.argv.indexOf('--compile') !== -1) {
@@ -198,4 +267,6 @@ if (process.argv.indexOf('--compile') !== -1) {
   )
 }
 
-module.exports = { web: webConfig }
+module.exports = {
+  web: webConfig
+}

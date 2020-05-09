@@ -1,7 +1,9 @@
 .workspace {
   padding-top: 20px;
-  min-height: 100vh;
+  height: 100%;
   background: #fdfdfd;
+  overflow: auto;
+
   h2 {
     margin: 0;
   }

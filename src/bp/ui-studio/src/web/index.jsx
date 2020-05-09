@@ -1,45 +1,62 @@
+import '@blueprintjs/core/lib/css/blueprint.css'
 import 'babel-polyfill'
 import React from 'expose-loader?React!react'
 import ReactDOM from 'expose-loader?ReactDOM!react-dom'
 import axios from 'axios'
 import { HotKeys } from 'react-hotkeys'
 import { getToken } from '~/util/Auth'
-/* eslint-disable */
-import Reactstrap from 'expose-loader?Reactstrap!reactstrap'
-import ReactSelect from 'expose-loader?ReactSelect!react-select'
-import PropTypes from 'expose-loader?PropTypes!prop-types'
-import ReactBootstrap from 'expose-loader?ReactBootstrap!react-bootstrap'
-import ContentPickerWidget from 'expose-loader?BotpressContentPicker!~/components/Content/Select/Widget'
-import ElementsList from 'expose-loader?ElementsList!~/components/Shared/ElementsList'
 import { Provider } from 'react-redux'
-import SelectActionDropdown from 'expose-loader?SelectActionDropdown!~/views/FlowBuilder/nodeProps/SelectActionDropdown'
-import { BotpressTooltip } from 'expose-loader?BotpressTooltip!~/components/Shared/Tooltip'
-import { LinkDocumentationProvider } from 'expose-loader?DocumentationProvider!~/components/Util/DocumentationProvider'
-/* eslint-enable */
 
 import store from './store'
-import { keyMap } from './keyboardShortcuts'
 
 // Required to fix outline issue
 import './style.scss'
+/* eslint-disable */
+import 'expose-loader?ReactSelect!react-select'
+import 'expose-loader?PropTypes!prop-types'
+import 'expose-loader?ReactBootstrap!react-bootstrap'
+import 'expose-loader?Reactstrap!reactstrap' // TODO Remove me once we migrated to blueprint
+import 'expose-loader?BlueprintJsCore!@blueprintjs/core'
+import 'expose-loader?BlueprintJsSelect!@blueprintjs/select'
+import 'expose-loader?BotpressShared!ui-shared'
+import 'expose-loader?BotpressContentPicker!~/components/Content/Select/Widget'
+import 'expose-loader?SmartInput!~/components/SmartInput'
+import 'expose-loader?ElementsList!~/components/Shared/ElementsList'
+import 'expose-loader?SelectActionDropdown!~/views/FlowBuilder/nodeProps/SelectActionDropdown'
+import 'expose-loader?BotpressTooltip!~/components/Shared/Tooltip'
+import 'expose-loader?BotpressUI!~/components/Shared/Interface'
+import 'expose-loader?BotpressUtils!~/components/Shared/Utils'
+import 'expose-loader?DocumentationProvider!~/components/Util/DocumentationProvider'
+import { initializeTranslations } from './translations'
+/* eslint-enable */
+import { utils } from 'botpress/shared'
 
+import 'ui-shared/dist/theme.css'
 require('bootstrap/dist/css/bootstrap.css')
 require('storm-react-diagrams/dist/style.min.css')
 require('./theme.scss')
 
 const token = getToken()
 if (token) {
-  axios.defaults.headers.common['Authorization'] = `Bearer ${token.token}`
+  axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
+  axios.defaults.headers.common['X-BP-Workspace'] = window.WORKSPACE_ID
 }
 
-// Do not use "import App from ..." as hoisting will screw up styling
-const App = require('./components/App').default
+if (!window.BOT_ID) {
+  console.error(`This bot doesn't exist. Redirecting to admin `)
+  window.location.href = `${window.ROOT_PATH}/admin`
+} else {
+  initializeTranslations()
 
-ReactDOM.render(
-  <Provider store={store}>
-    <HotKeys keyMap={keyMap}>
-      <App />
-    </HotKeys>
-  </Provider>,
-  document.getElementById('app')
-)
+  // Do not use "import App from ..." as hoisting will screw up styling
+  const App = require('./components/App').default
+
+  ReactDOM.render(
+    <Provider store={store}>
+      <HotKeys keyMap={utils.keyMap}>
+        <App />
+      </HotKeys>
+    </Provider>,
+    document.getElementById('app')
+  )
+}

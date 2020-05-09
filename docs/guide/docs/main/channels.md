@@ -88,7 +88,7 @@ Messenger requires you to have a Facebook App and a Facebook Page to setup your 
 - [Create a Facebook App](https://developers.facebook.com/docs/apps/)
 - [Create a Facebook Page](https://www.facebook.com/pages/creation/)
 - An HTTPS Endpoint to your bot
-  - Create an HTTPS tunnel to your marchine using Ngrok. [**Tutorial**](https://api.slack.com/tutorials/tunneling-with-ngrok)
+  - Create an HTTPS tunnel to your machine using Ngrok. [**Tutorial**](https://api.slack.com/tutorials/tunneling-with-ngrok)
   - Using Nginx and Let's Encrypt. [**Tutorial**](https://www.digitalocean.com/community/tutorials/how-to-secure-nginx-with-let-s-encrypt-on-ubuntu-16-04)
 
 ### Setup
@@ -101,7 +101,7 @@ Messenger requires you to have a Facebook App and a Facebook Page to setup your 
 - Set the following properties:
   - `appSecret`. You will find this value in your Facebook App page.
   - `verifyToken`. This is a random string you need to generate and keep secret. You'll need to copy/paste this token in the Facebook App portal when setting up your webhook.
-- Make sure you have an HTTPS url pointing to your Botpress Server and set the [`EXTERNAL_URL`](../advanced/configuration/#exposing-your-bot-on-the-internet) environment variable
+- Make sure you have an HTTPS url pointing to your Botpress Server and set the [`EXTERNAL_URL`](../advanced/configuration#exposing-your-bot-on-the-internet) environment variable
 - Restart Botpress Server to reload the configuration
 - Setup your webhook (see below)
 
@@ -124,7 +124,7 @@ Head over to `data/bots/<your_bot>/config/channel-messenger.json` and create the
 
 You will need to setup the following properties:
 
-- `accessToken` has to be set to your [Page Access Token](https://developers.facebook.com/docs/messenger-platform/getting-started/app-setup). [Official Reference](https://developers.facebook.com/docs/facebook-login/access-tokens/#pagetokens)
+- `accessToken` has to be set to your [Page Access Token](https://developers.facebook.com/docs/messenger-platform/getting-started/app-setup). [Official Reference](https://developers.facebook.com/docs/facebook-login/access-tokens#pagetokens)
 - `enabled` has to be set to `true`
 
 Restart Botpress Server to reload the configuration.
@@ -166,9 +166,9 @@ Some channels (e.g. Messenger) require to have a public secure url. When testing
 
 Assets are exposed using a configurable base path. Make sure the `EXTERNAL_URL` environment variable is set so that your assets are accessible from the outside.
 
-You can set the environment variable in a `.env` file located under `/data`.
+You can set the environment variable in a `.env` file located in the same folder as the Botpress executable.
 
-If you don't know anything about `.env` files, just create a new file named `.env` in your `/data` folder. Then add the following line to it:
+If you don't know anything about `.env` files, just create a new file named `.env` at the base of your project. Then add the following line to it:
 
 ```bash
 EXTERNAL_URL=<public_url>

@@ -1,11 +1,12 @@
 import React, { Component } from 'react'
 import { connect } from 'react-redux'
 import { fetchRoles } from '../../reducers/roles'
-import SectionLayout from '../Layouts/Section'
+import PageContainer from '~/App/PageContainer'
+import { lang } from 'botpress/shared'
 
 class Roles extends Component {
   componentDidMount() {
-    this.props.fetchRoles()
+    !this.props.roles.length && this.props.fetchRoles()
   }
 
   renderRoles() {
@@ -14,8 +15,8 @@ class Roles extends Component {
         {this.props.roles.map(role => {
           return (
             <div className="bp_table-row" key={role.id}>
-              <div className="title">{role.name}</div>
-              <p>{role.description}</p>
+              <div className="title">{lang.tr(role.name)}</div>
+              <p>{lang.tr(role.description)}</p>
             </div>
           )
         })}
@@ -25,13 +26,9 @@ class Roles extends Component {
 
   render() {
     return (
-      <SectionLayout
-        title="Roles"
-        helpText="To change roles, please see “roles” in the workspaces.json file."
-        activePage="roles"
-        currentTeam={this.props.team}
-        mainContent={this.renderRoles()}
-      />
+      <PageContainer title={lang.tr('admin.workspace.roles.title')} helpText={lang.tr('admin.workspace.rolesHelp')}>
+        {this.renderRoles()}
+      </PageContainer>
     )
   }
 }
@@ -44,7 +41,4 @@ const mapDispatchToProps = {
   fetchRoles
 }
 
-export default connect(
-  mapStateToProps,
-  mapDispatchToProps
-)(Roles)
+export default connect(mapStateToProps, mapDispatchToProps)(Roles)

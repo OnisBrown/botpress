@@ -1,13 +1,13 @@
-import { IO, Logger } from 'botpress/sdk'
+import { IO, Logger, NDU } from 'botpress/sdk'
 import { ConfigProvider } from 'core/config/config-loader'
 import { WellKnownFlags } from 'core/sdk/enums'
 import { TYPES } from 'core/types'
-import { inject, injectable, tagged } from 'inversify'
+import { inject, injectable, postConstruct, tagged } from 'inversify'
+import { AppLifecycle, AppLifecycleEvents } from 'lifecycle'
 import _ from 'lodash'
 import moment from 'moment'
 import ms from 'ms'
 
-import { CMSService } from '../cms'
 import { EventEngine } from '../middleware/event-engine'
 import { StateManager } from '../middleware/state-manager'
 
@@ -29,14 +29,88 @@ export class DecisionEngine {
     @inject(TYPES.ConfigProvider) private configProvider: ConfigProvider,
     @inject(TYPES.DialogEngine) private dialogEngine: DialogEngine,
     @inject(TYPES.EventEngine) private eventEngine: EventEngine,
-    @inject(TYPES.StateManager) private stateManager: StateManager,
-    @inject(TYPES.CMSService) private cms: CMSService
+    @inject(TYPES.StateManager) private stateManager: StateManager
   ) {}
 
-  private readonly MIN_CONFIDENCE = process.env.BP_DECISION_MIN_CONFIENCE || 0.3
+  private readonly MIN_CONFIDENCE = process.env.BP_DECISION_MIN_CONFIENCE || 0.5
   private readonly MIN_NO_REPEAT = ms(process.env.BP_DECISION_MIN_NO_REPEAT || '20s')
+  private noRepeatPolicy = false
+
+  @postConstruct()
+  async initialize() {
+    await AppLifecycle.waitFor(AppLifecycleEvents.CONFIGURATION_LOADED)
+    this.noRepeatPolicy = (await this.configProvider.getBotpressConfig()).noRepeatPolicy
+  }
+
+  private async processEventNDU(sessionId: string, event: IO.IncomingEvent) {
+    if (!event.ndu || !event.ndu.actions) {
+      return
+    }
+
+    let eventProcessedCalled = false
+    const processEvent = async (event: IO.IncomingEvent) => {
+      if (!eventProcessedCalled) {
+        eventProcessedCalled = true
+        this.onAfterEventProcessed && (await this.onAfterEventProcessed(event))
+      }
+    }
+
+    for (const { action, data } of event.ndu.actions) {
+      if (action === 'send' && data) {
+        const content = data as NDU.SendContent
+        await this._sendContent(content, event)
+
+        BOTPRESS_CORE_EVENT('bp_core_send_content', {
+          botId: event.botId,
+          channel: event.channel,
+          source: content.source,
+          details: content.sourceDetails!
+        })
+      } else if (action === 'redirect' || action === 'startWorkflow' || action === 'goToNode') {
+        const { flow, node } = data as NDU.FlowRedirect
+        const flowName = flow.endsWith('.flow.json') ? flow : `${flow}.flow.json`
+
+        await this.dialogEngine.jumpTo(sessionId, event, flowName, node)
+
+        if (action === 'startWorkflow') {
+          event.state.session.lastWorkflows = [
+            {
+              workflow: flowName,
+              eventId: event.id,
+              active: true
+            },
+            ...(event.state.session.lastWorkflows || [])
+          ]
+
+          BOTPRESS_CORE_EVENT('bp_core_workflow_started', { botId: event.botId, channel: event.channel, wfName: flow })
+        }
+      }
+    }
+
+    const hasContinue = event.ndu.actions.find(x => x.action === 'continue')
+    if (!event.hasFlag(WellKnownFlags.SKIP_DIALOG_ENGINE) && hasContinue) {
+      const processedEvent = await this.dialogEngine.processEvent(sessionId, event)
+
+      // In case there are no unknown errors, remove skills/ flow from the stacktrace
+      processedEvent.state.__stacktrace = processedEvent.state.__stacktrace.filter(x => !x.flow.startsWith('skills/'))
+      await processEvent(processedEvent)
+      await this.stateManager.persist(processedEvent, false)
+      return
+    }
+
+    if (event.hasFlag(WellKnownFlags.FORCE_PERSIST_STATE)) {
+      await processEvent(event)
+      await this.stateManager.persist(event, false)
+    }
+
+    await processEvent(event)
+  }
 
   public async processEvent(sessionId: string, event: IO.IncomingEvent) {
+    if (event.ndu) {
+      return this.processEventNDU(sessionId, event)
+    }
+
     const isInMiddleOfFlow = _.get(event, 'state.context.currentFlow', false)
     if (!event.suggestions) {
       Object.assign(event, { suggestions: [] })
@@ -62,6 +136,11 @@ export class DecisionEngine {
 
     if (elected) {
       Object.assign(event, { decision: elected })
+      BOTPRESS_CORE_EVENT('bp_core_decision_elected', {
+        botId: event.botId,
+        channel: event.channel,
+        source: elected.source || 'none'
+      })
       sendSuggestionResult = await this._sendSuggestion(elected, sessionId, event)
     }
 
@@ -80,6 +159,8 @@ export class DecisionEngine {
           }
         })
         const processedEvent = await this.dialogEngine.processEvent(sessionId, event)
+        // In case there are no unknown errors, remove skills/ flow from the stacktrace
+        processedEvent.state.__stacktrace = processedEvent.state.__stacktrace.filter(x => !x.flow.startsWith('skills/'))
         this.onAfterEventProcessed && (await this.onAfterEventProcessed(processedEvent))
 
         await this.stateManager.persist(processedEvent, false)
@@ -89,12 +170,27 @@ export class DecisionEngine {
           .forBot(event.botId)
           .attachError(err)
           .error('An unexpected error occurred.')
-        await this._sendErrorMessage(event)
+
+        await this._processErrorFlow(sessionId, event)
       }
     }
 
     if (event.hasFlag(WellKnownFlags.FORCE_PERSIST_STATE)) {
       await this.stateManager.persist(event, false)
+    }
+  }
+
+  // Part of processing is duplicated, since we don't want to get in an infinite loop if there's an error in the error handler
+  private async _processErrorFlow(sessionId: string, event) {
+    try {
+      await this.dialogEngine.jumpTo(sessionId, event, 'error', 'entry')
+      const processedEvent = await this.dialogEngine.processEvent(sessionId, event)
+      await this.stateManager.persist(processedEvent, false)
+    } catch (err) {
+      this.logger
+        .forBot(event.botId)
+        .attachError(err)
+        .error('An error occurred in the error handler. Abandoning.')
     }
   }
 
@@ -118,7 +214,7 @@ export class DecisionEngine {
 
       if (replies[i].confidence < this.MIN_CONFIDENCE) {
         replies[i].decision = { status: 'dropped', reason: `confidence lower than ${this.MIN_CONFIDENCE}` }
-      } else if (violatesRepeatPolicy) {
+      } else if (this.noRepeatPolicy && violatesRepeatPolicy) {
         replies[i].decision = { status: 'dropped', reason: `bot would repeat itself (within ${this.MIN_NO_REPEAT}ms)` }
       } else if (bestReply) {
         replies[i].decision = { status: 'dropped', reason: 'best suggestion already elected' }
@@ -127,6 +223,26 @@ export class DecisionEngine {
         replies[i].decision = { status: 'elected', reason: 'best remaining suggestion available' }
       }
     }
+  }
+
+  private async _sendContent(
+    { payloads, source, sourceDetails, confidence }: NDU.SendContent | IO.Suggestion,
+    event: IO.IncomingEvent
+  ) {
+    await this.eventEngine.replyToEvent(event, payloads, event.id)
+
+    const message: IO.DialogTurnHistory = {
+      eventId: event.id,
+      replyDate: new Date(),
+      replySource: source + ' ' + sourceDetails,
+      incomingPreview: event.preview,
+      replyConfidence: confidence,
+      replyPreview: _.find(payloads, p => p.text !== undefined)
+    }
+
+    event.state.session.lastMessages.push(message)
+
+    await this.stateManager.persist(event, true)
   }
 
   private async _sendSuggestion(
@@ -138,21 +254,8 @@ export class DecisionEngine {
     const result: SendSuggestionResult = { executeFlows: true }
 
     if (payloads) {
-      await this.eventEngine.replyToEvent(event, payloads, event.id)
-
-      const message: IO.DialogTurnHistory = {
-        eventId: event.id,
-        replyDate: new Date(),
-        replySource: reply.source + ' ' + reply.sourceDetails,
-        incomingPreview: event.preview,
-        replyConfidence: reply.confidence,
-        replyPreview: _.find(payloads, p => p.text !== undefined)
-      }
-
+      await this._sendContent({ ...reply, payloads }, event)
       result.executeFlows = false
-      event.state.session.lastMessages.push(message)
-
-      await this.stateManager.persist(event, true)
     }
 
     const redirect = _.find(reply.payloads, p => p.type === 'redirect')
@@ -166,18 +269,5 @@ export class DecisionEngine {
     }
 
     return result
-  }
-
-  private async _sendErrorMessage(event: IO.Event) {
-    const config = await this.configProvider.getBotConfig(event.botId)
-    const element = _.get(config, 'dialog.error.args', {
-      text: "😯 Oops! We've got a problem. Please try something else while we're fixing it 🔨",
-      typing: true
-    })
-    const contentType = _.get(config, 'dialog.error.contentType', 'builtin_text')
-    const eventDestination = _.pick(event, ['channel', 'target', 'botId', 'threadId'])
-    const payloads = await this.cms.renderElement(contentType, element, eventDestination)
-
-    await this.eventEngine.replyToEvent(event, payloads, event.id)
   }
 }

@@ -1,22 +1,24 @@
-import { Logger } from 'botpress/sdk'
+import * as sdk from 'botpress/sdk'
+import { AuthRule, ChatUserAuth, RequestWithUser, TokenUser, UserProfile } from 'common/typings'
 import { ConfigProvider } from 'core/config/config-loader'
-import { AuthConfig, RequestWithUser } from 'core/misc/interfaces'
 import { AuthStrategies } from 'core/services/auth-strategies'
 import AuthService, { TOKEN_AUDIENCE } from 'core/services/auth/auth-service'
+import StrategyBasic from 'core/services/auth/basic'
 import { WorkspaceService } from 'core/services/workspace-service'
-import { Request, RequestHandler, Router } from 'express'
+import { RequestHandler, Router } from 'express'
 import Joi from 'joi'
+import { AppLifecycle, AppLifecycleEvents } from 'lifecycle'
 import _ from 'lodash'
 
 import { CustomRouter } from './customRouter'
 import { BadRequestError, NotFoundError } from './errors'
-import { checkTokenHeader, success as sendSuccess, validateBodySchema } from './util'
+import { assertWorkspace, checkTokenHeader, success as sendSuccess, validateBodySchema } from './util'
 
 export class AuthRouter extends CustomRouter {
   private checkTokenHeader!: RequestHandler
 
   constructor(
-    logger: Logger,
+    private logger: sdk.Logger,
     private authService: AuthService,
     private configProvider: ConfigProvider,
     private workspaceService: WorkspaceService,
@@ -27,131 +29,125 @@ export class AuthRouter extends CustomRouter {
 
     // tslint:disable-next-line: no-floating-promises
     this.setupRoutes()
+    // tslint:disable-next-line: no-floating-promises
+    this.setupStrategies()
   }
 
-  login = async (req: Request, res) => {
-    const token = await this.authService.login(req.body.email, req.body.password, req.body.newPassword, req.ip)
+  async setupStrategies() {
+    // Waiting until the auth service was initialized (& config updated, if it's the first time)
+    await AppLifecycle.waitFor(AppLifecycleEvents.SERVICES_READY)
 
-    return sendSuccess(res, 'Login successful', { token })
-  }
+    const strategyTypes = (await this.authService.getAllStrategies()).map(x => x.type)
 
-  getAuthStrategy = async () => {
-    const config = await this.configProvider.getBotpressConfig()
-    const strategy = _.get(config, 'pro.auth.strategy', 'basic')
-    const authEndpoint = _.get(config, 'pro.auth.options.authEndpoint')
-
-    return { strategy, authEndpoint } as Partial<AuthConfig>
-  }
-
-  getAuthConfig = async () => {
-    const usersList = await this.workspaceService.listUsers()
-    const isFirstTimeUse = !usersList || !usersList.length
-
-    return { isFirstTimeUse, ...(await this.getAuthStrategy()) } as AuthConfig
-  }
-
-  register = async (req: RequestWithUser, res) => {
-    const config = await this.getAuthConfig()
-    if (!config.isFirstTimeUse) {
-      res.status(403).send(`Registration is disabled`)
-    } else {
-      const { email, password } = req.body
-      if (email.length < 4 || password.length < 4) {
-        throw new BadRequestError('Email or password is too short.')
-      }
-      const token = await this.authService.register(email, password, req.ip)
-      return sendSuccess(res, 'Registration successful', { token })
-    }
-  }
-
-  sendConfig = async (req, res) => {
-    return sendSuccess(res, 'Auth Config', await this.getAuthConfig())
-  }
-
-  getProfile = async (req: RequestWithUser, res) => {
-    const { tokenUser } = req
-    const user = await this.authService.findUserByEmail(tokenUser!.email, [
-      'company',
-      'email',
-      'provider',
-      'firstname',
-      'lastname'
-    ])
-
-    if (!user) {
-      throw new NotFoundError(`User ${tokenUser!.email || ''} not found`)
+    if (process.IS_PRO_ENABLED) {
+      this.authStrategies.setup(this.router, strategyTypes)
     }
 
-    const userRole = await this.workspaceService.getRoleForUser(user.email)
+    if (strategyTypes.includes('basic')) {
+      const basicStrategies = new StrategyBasic(this.logger, this.router, this.authService)
+      basicStrategies.setup()
 
-    const userProfile = {
-      ...user,
-      isSuperAdmin: tokenUser!.isSuperAdmin,
-      fullName: [user!.firstname, user!.lastname].filter(Boolean).join(' '),
-      permissions: userRole && userRole.rules
+      this.authService.strategyBasic = basicStrategies
     }
-
-    return sendSuccess(res, 'Retrieved profile successfully', userProfile)
-  }
-
-  updateProfile = async (req, res) => {
-    validateBodySchema(
-      req,
-      Joi.object().keys({
-        firstname: Joi.string()
-          .min(0)
-          .max(35)
-          .trim()
-          .required(),
-        lastname: Joi.string()
-          .min(0)
-          .max(35)
-          .trim()
-          .required()
-      })
-    )
-
-    await this.workspaceService.updateUser(req.tokenUser.email, {
-      firstname: req.body.firstname,
-      lastname: req.body.lastname
-    })
-    return sendSuccess(res, 'Updated profile successfully')
-  }
-
-  getPermissions = async (req, res) => {
-    const { tokenUser } = <RequestWithUser>req
-    const role = await this.workspaceService.getRoleForUser(tokenUser!.email)
-    if (!role) {
-      throw new NotFoundError(`Role for user "${tokenUser!.email}" doesn't exist`)
-    }
-    return sendSuccess(res, "Retrieved user's permissions successfully", role.rules)
-  }
-
-  sendSuccess = async (req, res) => {
-    return sendSuccess(res)
   }
 
   async setupRoutes() {
     const router = this.router
 
-    const authStrategy = await this.getAuthStrategy()
+    router.get(
+      '/config',
+      this.asyncMiddleware(async (req, res) => {
+        return sendSuccess(res, 'Auth Config', await this.authService.getCollaboratorsConfig())
+      })
+    )
 
-    if (process.IS_PRO_ENABLED && authStrategy.strategy !== 'basic') {
-      this.authStrategies.setup(router)
-    } else {
-      router.post('/login', this.asyncMiddleware(this.login))
-      router.post('/register', this.asyncMiddleware(this.register))
-    }
+    router.get(
+      '/ping',
+      this.checkTokenHeader,
+      this.asyncMiddleware(async (req, res) => {
+        sendSuccess(res, 'Pong', { serverId: process.SERVER_ID })
+      })
+    )
 
-    router.get('/config', this.asyncMiddleware(this.sendConfig))
+    router.get(
+      '/me/profile',
+      this.checkTokenHeader,
+      assertWorkspace,
+      this.asyncMiddleware(async (req: RequestWithUser, res) => {
+        const { email, strategy, isSuperAdmin } = req.tokenUser!
+        const user = await this.authService.findUser(email, strategy)
+        if (!user) {
+          throw new NotFoundError(`User ${email || ''} not found`)
+        }
+        const { firstname, lastname, picture_url } = user.attributes
+        const { type } = await this.authService.getStrategy(strategy)
 
-    router.get('/ping', this.checkTokenHeader, this.asyncMiddleware(this.sendSuccess))
+        const permissions = await this.getUserPermissions(req.tokenUser!, req.workspace!)
 
-    router.get('/me/profile', this.checkTokenHeader, this.asyncMiddleware(this.getProfile))
+        const userProfile: UserProfile = {
+          firstname,
+          lastname,
+          email,
+          picture_url,
+          strategyType: type,
+          strategy,
+          isSuperAdmin,
+          fullName: [firstname, lastname].filter(Boolean).join(' '),
+          permissions
+        }
 
-    router.post('/me/profile', this.checkTokenHeader, this.asyncMiddleware(this.updateProfile))
+        return sendSuccess(res, 'Retrieved profile successfully', userProfile)
+      })
+    )
 
-    router.get('/me/permissions', this.checkTokenHeader, this.asyncMiddleware(this.getPermissions))
+    router.post(
+      '/me/profile',
+      this.checkTokenHeader,
+      this.asyncMiddleware(async (req: RequestWithUser, res) => {
+        const { email, strategy } = req.tokenUser!
+
+        validateBodySchema(
+          req,
+          Joi.object().keys({
+            firstname: Joi.string()
+              .min(0)
+              .max(35)
+              .trim()
+              .allow(''),
+            lastname: Joi.string()
+              .min(0)
+              .max(35)
+              .trim()
+              .allow('')
+          })
+        )
+
+        await this.authService.updateAttributes(email, strategy, {
+          firstname: req.body.firstname,
+          lastname: req.body.lastname
+        })
+
+        return sendSuccess(res, 'Updated profile successfully')
+      })
+    )
+
+    router.get(
+      '/me/workspaces',
+      this.checkTokenHeader,
+      this.asyncMiddleware(async (req: RequestWithUser, res) => {
+        const { email, strategy, isSuperAdmin } = req.tokenUser!
+
+        if (!isSuperAdmin) {
+          return res.send(await this.workspaceService.getUserWorkspaces(email, strategy))
+        }
+
+        res.send(
+          await Promise.map(this.workspaceService.getWorkspaces(), w => {
+            return { email, strategy, workspace: w.id, role: w.adminRole, workspaceName: w.name }
+          })
+        )
+      })
+    )
 
     router.get(
       '/refresh',
@@ -168,5 +164,37 @@ export class AuthRouter extends CustomRouter {
         }
       })
     )
+
+    router.post(
+      '/me/chatAuth',
+      this.checkTokenHeader,
+      this.asyncMiddleware(async (req: RequestWithUser, res) => {
+        const { botId, sessionId, signature } = req.body as ChatUserAuth
+
+        if (!botId || !sessionId || !signature) {
+          throw new BadRequestError('Missing required fields')
+        }
+
+        await this.authService.authChatUser(req.body, req.tokenUser!)
+        res.send(await this.workspaceService.getBotWorkspaceId(botId))
+      })
+    )
+  }
+
+  getUserPermissions = async (user: TokenUser, workspaceId: string): Promise<AuthRule[]> => {
+    const { email, strategy, isSuperAdmin } = user
+    const userRole = await this.workspaceService.getRoleForUser(email, strategy, workspaceId)
+
+    if (isSuperAdmin) {
+      return [{ res: '*', op: '+r+w' }]
+    } else if (!userRole) {
+      return [{ res: '*', op: '-r-w' }]
+    } else {
+      return userRole.rules
+    }
+  }
+
+  sendSuccess = async (req, res) => {
+    return sendSuccess(res)
   }
 }

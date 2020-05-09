@@ -31,21 +31,24 @@ const validateChoice = async data => {
   }
 
   if (!choice) {
+    const preview = (event.preview || '').toLowerCase()
+    const userText = ((event.payload && event.payload.text) || '').toLowerCase()
+    const choiceValue = ((event.payload && event.payload.payload) || '').toLowerCase()
+
     choice = _.findKey(data.keywords, keywords =>
-      _.some(
-        keywords || [],
-        k =>
-          _.includes((event.preview || '').toLowerCase(), (k || '').toLowerCase()) ||
-          (event.payload && _.includes(_.get(event, 'payload.text', '').toLowerCase(), (k || '').toLowerCase()))
-      )
+      _.some(keywords || [], k => {
+        const keyword = (k || '').toLowerCase()
+        return preview.includes(keyword) || userText.includes(keyword) || choiceValue.includes(keyword)
+      })
     )
   }
 
+  const keySuffix = args.randomId ? `-${args.randomId}` : ''
   if (choice) {
-    temp['skill-choice-valid'] = true
-    temp['skill-choice-ret'] = choice
+    temp[`skill-choice-valid${keySuffix}`] = true
+    temp[`skill-choice-ret${keySuffix}`] = choice
   } else {
-    temp['skill-choice-valid'] = false
+    temp[`skill-choice-valid${keySuffix}`] = false
   }
 }
 

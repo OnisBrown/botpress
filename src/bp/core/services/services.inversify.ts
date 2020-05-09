@@ -5,15 +5,18 @@ import { ContainerModule, interfaces } from 'inversify'
 
 import { TYPES } from '../types'
 
+import ActionServersService from './action/action-servers-service'
 import ActionService from './action/action-service'
 import { AlertingService, CEAlertingService } from './alerting-service'
 import { AuthStrategies, CEAuthStrategies } from './auth-strategies'
 import AuthService from './auth/auth-service'
+import { BotMonitoringService } from './bot-monitoring-service'
 import { BotService } from './bot-service'
 import { CMSService } from './cms'
 import { ConverseService } from './converse'
 import { SkillService } from './dialog/skill/service'
 import { GhostContainerModule } from './ghost/ghost.inversify'
+import { HintsService } from './hints'
 import { HookService } from './hook/hook-service'
 import { KeyValueStore } from './kvs'
 import CELicensingService from './licensing'
@@ -26,6 +29,7 @@ import { NotificationsService } from './notification/service'
 import { Queue } from './queue'
 import MemoryQueue from './queue/memory-queue'
 import RealtimeService from './realtime'
+import { StatsService } from './stats-service'
 
 const ServicesContainerModule = new ContainerModule((bind: interfaces.Bind) => {
   bind<CMSService>(TYPES.CMSService)
@@ -38,6 +42,10 @@ const ServicesContainerModule = new ContainerModule((bind: interfaces.Bind) => {
 
   bind<ActionService>(TYPES.ActionService)
     .to(ActionService)
+    .inSingletonScope()
+
+  bind<ActionServersService>(TYPES.ActionServersService)
+    .to(ActionServersService)
     .inSingletonScope()
 
   bind<LicensingService>(TYPES.LicensingService)
@@ -60,6 +68,10 @@ const ServicesContainerModule = new ContainerModule((bind: interfaces.Bind) => {
     .inSingletonScope()
     .when(() => !process.CLUSTER_ENABLED || !process.IS_PRO_ENABLED)
 
+  bind<BotMonitoringService>(TYPES.BotMonitoringService)
+    .to(BotMonitoringService)
+    .inSingletonScope()
+
   bind<AuthStrategies>(TYPES.AuthStrategies)
     .to(CEAuthStrategies)
     .inSingletonScope()
@@ -75,6 +87,10 @@ const ServicesContainerModule = new ContainerModule((bind: interfaces.Bind) => {
 
   bind<HookService>(TYPES.HookService)
     .to(HookService)
+    .inSingletonScope()
+
+  bind<HintsService>(TYPES.HintsService)
+    .to(HintsService)
     .inSingletonScope()
 
   bind<EventEngine>(TYPES.EventEngine)
@@ -115,6 +131,10 @@ const ServicesContainerModule = new ContainerModule((bind: interfaces.Bind) => {
 
   bind<BotService>(TYPES.BotService)
     .to(BotService)
+    .inSingletonScope()
+
+  bind<StatsService>(TYPES.StatsService)
+    .to(StatsService)
     .inSingletonScope()
 })
 

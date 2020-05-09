@@ -10,6 +10,9 @@ import { applyDisposeOnExit, applyInitializeFromConfig } from './misc/inversify'
 import { ModuleLoader } from './module-loader'
 import { RepositoriesContainerModules } from './repositories/repositories.inversify'
 import HTTPServer from './server'
+import { LocalActionServer } from './services/action/local-action-server'
+import { EventCollector } from './services/middleware/event-collector'
+import { MigrationService } from './services/migration'
 import { DataRetentionJanitor } from './services/retention/janitor'
 import { DataRetentionService } from './services/retention/service'
 import { ServicesContainerModules } from './services/services.inversify'
@@ -27,7 +30,7 @@ container.bind<string>(TYPES.Logger_Name).toDynamicValue(ctx => {
   let loggerName = (targetName && targetName.value()) || (byProvider && byProvider.value)
 
   if (!loggerName) {
-    // Was injected in a logger, which was injected in an other class
+    // Was injected in a logger, which was injected in another class
     // And that class has a service identifier, which may be a Symbol
     const endclass = ctx.currentRequest.parentRequest && ctx.currentRequest.parentRequest.parentRequest
 
@@ -37,7 +40,7 @@ container.bind<string>(TYPES.Logger_Name).toDynamicValue(ctx => {
     }
   }
 
-  return loggerName || 'Unknown'
+  return loggerName || ''
 })
 
 container.bind<Logger>(TYPES.Logger).to(PersistedConsoleLogger)
@@ -100,6 +103,21 @@ container
 container
   .bind<WorkspaceService>(TYPES.WorkspaceService)
   .to(WorkspaceService)
+  .inSingletonScope()
+
+container
+  .bind<EventCollector>(TYPES.EventCollector)
+  .to(EventCollector)
+  .inSingletonScope()
+
+container
+  .bind<MigrationService>(TYPES.MigrationService)
+  .to(MigrationService)
+  .inSingletonScope()
+
+container
+  .bind<LocalActionServer>(TYPES.LocalActionServer)
+  .to(LocalActionServer)
   .inSingletonScope()
 
 const isPackaged = !!eval('process.pkg')

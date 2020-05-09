@@ -1,18 +1,28 @@
 import { BotConfig, BotTemplate, Logger, Stage } from 'botpress/sdk'
-import { BotCreationSchema, BotEditSchema } from 'common/validation'
+import cluster from 'cluster'
+import { BotHealth, ServerHealth } from 'common/typings'
+import { BotCreationSchema, BotEditSchema, isValidBotId } from 'common/validation'
 import { createForGlobalHooks } from 'core/api'
 import { ConfigProvider } from 'core/config/config-loader'
+import { PersistedConsoleLogger } from 'core/logger'
+import { IDisposable } from 'core/misc/disposable'
 import { listDir } from 'core/misc/list-dir'
+import { stringify } from 'core/misc/utils'
 import { ModuleLoader } from 'core/module-loader'
+import { RealTimePayload } from 'core/sdk/impl'
 import { Statistics } from 'core/stats'
 import { TYPES } from 'core/types'
 import { WrapErrorsWith } from 'errors'
 import fse from 'fs-extra'
+import glob from 'glob'
 import { inject, injectable, postConstruct, tagged } from 'inversify'
 import Joi from 'joi'
 import _ from 'lodash'
 import moment from 'moment'
+import ms from 'ms'
+import os from 'os'
 import path from 'path'
+import replace from 'replace-in-file'
 import tmp from 'tmp'
 import { VError } from 'verror'
 
@@ -20,15 +30,19 @@ import { extractArchive } from '../misc/archive'
 
 import { InvalidOperationError } from './auth/errors'
 import { CMSService } from './cms'
+import { ReplaceContent } from './ghost'
 import { FileContent, GhostService } from './ghost/service'
 import { Hooks, HookService } from './hook/hook-service'
 import { JobService } from './job-service'
+import { MigrationService } from './migration'
 import { ModuleResourceLoader } from './module/resources-loader'
+import RealtimeService from './realtime'
 import { WorkspaceService } from './workspace-service'
 
 const BOT_DIRECTORIES = ['actions', 'flows', 'entities', 'content-elements', 'intents', 'qna']
 const BOT_CONFIG_FILENAME = 'bot.config.json'
 const REVISIONS_DIR = './revisions'
+const BOT_ID_PLACEHOLDER = '/bots/BOT_ID_PLACEHOLDER/'
 const REV_SPLIT_CHAR = '++'
 const MAX_REV = 10
 const DEFAULT_BOT_CONFIGS = {
@@ -38,6 +52,13 @@ const DEFAULT_BOT_CONFIGS = {
   details: {}
 }
 
+const STATUS_REFRESH_INTERVAL = ms('15s')
+const STATUS_EXPIRY = ms('20s')
+const DEFAULT_BOT_HEALTH: BotHealth = { status: 'disabled', errorCount: 0, warningCount: 0, criticalCount: 0 }
+
+const getBotStatusKey = (serverId: string) => `bp_server_${serverId}_bots`
+const debug = DEBUG('services:bots')
+
 @injectable()
 export class BotService {
   public mountBot: Function = this._localMount
@@ -45,6 +66,9 @@ export class BotService {
 
   private _botIds: string[] | undefined
   private static _mountedBots: Map<string, boolean> = new Map()
+  private static _botListenerHandles: Map<string, IDisposable> = new Map()
+  private static _botHealth: { [botId: string]: BotHealth } = {}
+  private _updateBotHealthDebounce = _.debounce(this._updateBotHealth, 500)
 
   constructor(
     @inject(TYPES.Logger)
@@ -57,7 +81,9 @@ export class BotService {
     @inject(TYPES.ModuleLoader) private moduleLoader: ModuleLoader,
     @inject(TYPES.JobService) private jobService: JobService,
     @inject(TYPES.Statistics) private stats: Statistics,
-    @inject(TYPES.WorkspaceService) private workspaceService: WorkspaceService
+    @inject(TYPES.WorkspaceService) private workspaceService: WorkspaceService,
+    @inject(TYPES.RealtimeService) private realtimeService: RealtimeService,
+    @inject(TYPES.MigrationService) private migrationService: MigrationService
   ) {
     this._botIds = undefined
   }
@@ -66,18 +92,19 @@ export class BotService {
   async init() {
     this.mountBot = await this.jobService.broadcast<void>(this._localMount.bind(this))
     this.unmountBot = await this.jobService.broadcast<void>(this._localUnmount.bind(this))
+
+    if (!cluster.isMaster) {
+      setInterval(() => this._updateBotHealthDebounce(), STATUS_REFRESH_INTERVAL)
+    }
   }
 
   async findBotById(botId: string): Promise<BotConfig | undefined> {
-    const bot = await this.configProvider.getBotConfig(botId)
-    !bot && this.logger.warn(`Bot "${botId}" not found. Make sure it exists on your filesystem or database.`)
-
-    // @deprecated > 11 : New bots all define default language
-    if (!bot.defaultLanguage) {
-      bot.disabled = true
+    if (!(await this.ghostService.forBot(botId).fileExists('/', 'bot.config.json'))) {
+      this.logger.forBot(botId).warn(`Bot "${botId}" not found. Make sure it exists on your filesystem or database.`)
+      return
     }
 
-    return bot
+    return this.configProvider.getBotConfig(botId)
   }
 
   async findBotsByIds(botsIds: string[]): Promise<BotConfig[]> {
@@ -103,20 +130,22 @@ export class BotService {
         const bot = await this.findBotById(botId)
         bot && bots.set(botId, bot)
       } catch (err) {
-        this.logger.attachError(err).error(`Bot configuration file not found for bot "${botId}"`)
+        this.logger
+          .forBot(botId)
+          .attachError(err)
+          .error(`Bot configuration file not found for bot "${botId}"`)
       }
     }
 
     return bots
   }
 
-  async getBotsIds(): Promise<string[]> {
-    if (this._botIds) {
-      return this._botIds
+  async getBotsIds(ignoreCache?: boolean): Promise<string[]> {
+    if (!this._botIds || ignoreCache) {
+      this._botIds = (await this.ghostService.bots().directoryListing('/', BOT_CONFIG_FILENAME)).map(path.dirname)
     }
 
-    const bots = await this.ghostService.bots().directoryListing('/', BOT_CONFIG_FILENAME)
-    return (this._botIds = _.map(bots, x => path.dirname(x)))
+    return this._botIds
   }
 
   async addBot(bot: BotConfig, botTemplate: BotTemplate): Promise<void> {
@@ -145,6 +174,10 @@ export class BotService {
       throw new InvalidOperationError(`An error occurred while updating the bot: ${error.message}`)
     }
 
+    if (!(await this.botExists(botId))) {
+      throw new Error(`Bot "${botId}" doesn't exist`)
+    }
+
     if (!process.IS_PRO_ENABLED && updatedBot.languages && updatedBot.languages.length > 1) {
       throw new Error('A single language is allowed on community edition.')
     }
@@ -163,19 +196,26 @@ export class BotService {
     ]) as Partial<BotConfig>
 
     // bot needs to be mounted to perform the language changes
-    updatedFields.disabled = updatedFields.disabled && actualBot.defaultLanguage == updatedFields.defaultLanguage
+    if (updatedFields.defaultLanguage && updatedFields.defaultLanguage != actualBot.defaultLanguage) {
+      updatedFields.disabled = false
+    }
 
     await this.configProvider.setBotConfig(botId, {
       ...actualBot,
       ...updatedFields
     })
 
-    if (actualBot.disabled && !updatedBot.disabled) {
+    if (!updatedBot.disabled) {
+      if (this.isBotMounted(botId)) {
+        // we need to remount the bot to update the config
+        await this.unmountBot(botId)
+      }
+
       await this.mountBot(botId)
     }
 
     if (actualBot.defaultLanguage !== updatedBot.defaultLanguage) {
-      await this.cms.translateContentProps(botId, actualBot.defaultLanguage, updatedBot.defaultLanguage)
+      await this.cms.translateContentProps(botId, actualBot.defaultLanguage, updatedBot.defaultLanguage!)
     }
 
     // This will regenerate previews for all the bot's languages
@@ -189,15 +229,29 @@ export class BotService {
   }
 
   async exportBot(botId: string): Promise<Buffer> {
-    return this.ghostService.forBot(botId).exportToArchiveBuffer('models/*')
+    const replaceContent: ReplaceContent = {
+      from: [new RegExp(`/bots/${botId}/`, 'g')],
+      to: [BOT_ID_PLACEHOLDER]
+    }
+
+    return this.ghostService.forBot(botId).exportToArchiveBuffer('models/**/*', replaceContent)
   }
 
-  async importBot(botId: string, archive: Buffer, allowOverwrite?: boolean): Promise<void> {
+  async importBot(botId: string, archive: Buffer, workspaceId: string, allowOverwrite?: boolean): Promise<void> {
+    const startTime = Date.now()
+    if (!isValidBotId(botId)) {
+      throw new InvalidOperationError(`Can't import bot; the bot ID contains invalid characters`)
+    }
+
     if (await this.botExists(botId)) {
       if (!allowOverwrite) {
-        return this.logger.error(`Cannot import the bot ${botId}, it already exists, and overwrite is not allowed`)
+        throw new InvalidOperationError(
+          `Cannot import the bot ${botId}, it already exists, and overwriting is not allowed`
+        )
       } else {
-        this.logger.warn(`The bot ${botId} already exists, files in the archive will overwrite existing ones`)
+        this.logger
+          .forBot(botId)
+          .warn(`The bot ${botId} already exists, files in the archive will overwrite existing ones`)
       }
     }
     const tmpDir = tmp.dirSync({ unsafeCleanup: true })
@@ -214,12 +268,24 @@ export class BotService {
       await this.hookService.executeHook(new Hooks.BeforeBotImport(api, botId, tmpFolder, hookResult))
 
       if (hookResult.allowImport) {
-        await this.ghostService.forBot(botId).importFromDirectory(tmpDir.name)
+        const pipeline = await this.workspaceService.getPipeline(workspaceId)
+
+        await replace({
+          files: `${tmpDir.name}/**/*.json`,
+          from: new RegExp(BOT_ID_PLACEHOLDER, 'g'),
+          to: `/bots/${botId}/`
+        })
+
+        const folder = await this._validateBotArchive(tmpDir.name)
+        await this.ghostService.forBot(botId).importFromDirectory(folder)
+        const originalConfig = await this.configProvider.getBotConfig(botId)
+
         const newConfigs = <Partial<BotConfig>>{
           id: botId,
+          name: botId === originalConfig.name ? originalConfig.name : `${originalConfig.name} (${botId})`,
           pipeline_status: {
             current_stage: {
-              id: (await this.workspaceService.getPipeline())[0].id,
+              id: pipeline && pipeline[0].id,
               promoted_by: 'system',
               promoted_on: new Date()
             }
@@ -228,23 +294,61 @@ export class BotService {
         if (await this.botExists(botId)) {
           await this.unmountBot(botId)
         }
-        await this.configProvider.mergeBotConfig(botId, newConfigs)
-        await this.mountBot(botId)
-        this.logger.info(`Import of bot ${botId} successful`)
+
+        await this.configProvider.mergeBotConfig(botId, newConfigs, true)
+
+        await this.workspaceService.addBotRef(botId, workspaceId)
+
+        await this._migrateBotContent(botId)
+
+        if (!originalConfig.disabled) {
+          if (!(await this.mountBot(botId))) {
+            this.logger.forBot(botId).warn(`Import of bot ${botId} completed, but it couldn't be mounted`)
+            return
+          }
+        } else {
+          BotService.setBotStatus(botId, 'disabled')
+        }
+
+        this.logger.forBot(botId).info(`Import of bot ${botId} successful`)
       } else {
-        this.logger.info(`Import of bot ${botId} was denied by hook validation`)
+        this.logger.forBot(botId).info(`Import of bot ${botId} was denied by hook validation`)
       }
     } finally {
+      this._invalidateBotIds()
       tmpDir.removeCallback()
+      debug.forBot(botId, `Bot import took ${Date.now() - startTime}ms`)
     }
   }
 
-  async requestStageChange(botId: string, requested_by: string) {
+  private async _validateBotArchive(directory: string): Promise<string> {
+    const configFile = await Promise.fromCallback<string[]>(cb => glob('**/bot.config.json', { cwd: directory }, cb))
+    if (configFile.length > 1) {
+      throw new InvalidOperationError(`Bots must be imported in separate archives`)
+    } else if (configFile.length !== 1) {
+      throw new InvalidOperationError(`The archive doesn't seem to contain a bot`)
+    }
+
+    return path.join(directory, path.dirname(configFile[0]))
+  }
+
+  private async _migrateBotContent(botId: string): Promise<void> {
+    const config = await this.configProvider.getBotConfig(botId)
+    return this.migrationService.executeMissingBotMigrations(botId, config.version)
+  }
+
+  async requestStageChange(botId: string, requestedBy: string) {
     const botConfig = (await this.findBotById(botId)) as BotConfig
     if (!botConfig) {
       throw Error('bot does not exist')
     }
-    const pipeline = await this.workspaceService.getPipeline()
+
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(botId)
+    const pipeline = await this.workspaceService.getPipeline(workspaceId)
+    if (!pipeline) {
+      return
+    }
+
     const nextStageIdx = pipeline.findIndex(s => s.id === botConfig.pipeline_status.current_stage.id) + 1
     if (nextStageIdx >= pipeline.length) {
       this.logger.debug('end of pipeline')
@@ -255,10 +359,36 @@ export class BotService {
       id: pipeline[nextStageIdx].id,
       status: 'pending',
       requested_on: new Date(),
-      requested_by
+      requested_by: requestedBy
     }
 
     const newConfig = await this.configProvider.mergeBotConfig(botId, { pipeline_status: { stage_request } })
+    await this._executeStageChangeHooks(botConfig, newConfig)
+  }
+
+  async approveStageChange(botId: string, requestedBy: string, userStrategy: string) {
+    const botConfig = (await this.findBotById(botId)) as BotConfig
+    if (!botConfig) {
+      throw Error('bot does not exist')
+    }
+    if (!botConfig.pipeline_status!.stage_request) {
+      throw Error('bot does not have a stage request')
+    }
+
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(botId)
+    const pipeline = await this.workspaceService.getPipeline(workspaceId)
+    if (!pipeline) {
+      return
+    }
+
+    const approvals = botConfig.pipeline_status.stage_request?.approvals || []
+    if (!approvals.find(a => a.email === requestedBy && a.strategy === userStrategy)) {
+      approvals.push({ email: requestedBy, strategy: userStrategy })
+    }
+
+    const newConfig = await this.configProvider.mergeBotConfig(botId, {
+      pipeline_status: { stage_request: { approvals } }
+    })
     await this._executeStageChangeHooks(botConfig, newConfig)
   }
 
@@ -270,7 +400,9 @@ export class BotService {
       throw new Error('New bot id needs to differ from original bot')
     }
     if (!overwriteDest && (await this.botExists(destBotId))) {
-      this.logger.warn('Tried to duplicate a bot to existing destination id without allowing to overwrite')
+      this.logger
+        .forBot(destBotId)
+        .warn('Tried to duplicate a bot to existing destination id without allowing to overwrite')
       return
     }
 
@@ -280,20 +412,28 @@ export class BotService {
     await Promise.all(
       botContent.map(async file => destGhost.upsertFile('/', file, await sourceGhost.readFileAsBuffer('/', file)))
     )
-
-    await this.workspaceService.addBotRef(destBotId)
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(sourceBotId)
+    await this.workspaceService.addBotRef(destBotId, workspaceId)
     await this.mountBot(destBotId)
   }
 
-  private async botExists(botId: string): Promise<boolean> {
-    return (await this.getBotsIds()).includes(botId)
+  public async botExists(botId: string, ignoreCache?: boolean): Promise<boolean> {
+    return (await this.getBotsIds(ignoreCache)).includes(botId)
   }
 
   private async _executeStageChangeHooks(beforeRequestConfig: BotConfig, currentConfig: BotConfig) {
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(currentConfig.id)
+    const pipeline = await this.workspaceService.getPipeline(workspaceId)
+    if (!pipeline) {
+      return
+    }
+
     const bpConfig = await this.configProvider.getBotpressConfig()
     const alteredBot = _.cloneDeep(currentConfig)
-    const users = await this.workspaceService.listUsers(['email', 'role'])
-    const pipeline = await this.workspaceService.getPipeline()
+
+    const attributes = ['last_logon', 'firstname', 'lastname']
+    const users = await this.workspaceService.getWorkspaceUsersAttributes(workspaceId, attributes)
+
     const api = await createForGlobalHooks()
     const currentStage = <Stage>pipeline.find(s => s.id === currentConfig.pipeline_status.current_stage.id)
     const hookResult = {
@@ -303,13 +443,13 @@ export class BotService {
     await this.hookService.executeHook(new Hooks.OnStageChangeRequest(api, alteredBot, users, pipeline, hookResult))
     if (_.isArray(hookResult.actions)) {
       await Promise.map(hookResult.actions, async action => {
-        if (bpConfig.autoRevision) {
+        if (bpConfig.autoRevision && (await this.botExists(alteredBot.id))) {
           await this.createRevision(alteredBot.id)
         }
         if (action === 'promote_copy') {
           return this._promoteCopy(currentConfig, alteredBot)
         } else if (action === 'promote_move') {
-          return this._promoteMove(alteredBot)
+          return this._promoteMove(currentConfig, alteredBot)
         }
       })
     }
@@ -324,14 +464,20 @@ export class BotService {
     }
   }
 
-  private async _promoteMove(bot: BotConfig) {
-    bot.pipeline_status.current_stage = {
-      id: bot.pipeline_status.stage_request!.id,
-      promoted_by: bot.pipeline_status.stage_request!.requested_by,
+  private async _promoteMove(bot: BotConfig, finalBot: BotConfig) {
+    finalBot.pipeline_status.current_stage = {
+      id: finalBot.pipeline_status.stage_request!.id,
+      promoted_by: finalBot.pipeline_status.stage_request!.requested_by,
       promoted_on: new Date()
     }
-    delete bot.pipeline_status.stage_request
-    return this.configProvider.setBotConfig(bot.id, bot)
+    delete finalBot.pipeline_status.stage_request
+    if (bot.id === finalBot.id) {
+      return this.configProvider.setBotConfig(bot.id, finalBot)
+    }
+
+    await this.configProvider.setBotConfig(bot.id, finalBot)
+    await this.duplicateBot(bot.id, finalBot.id, true)
+    await this.deleteBot(bot.id)
   }
 
   private async _promoteCopy(initialBot: BotConfig, newBot: BotConfig) {
@@ -353,7 +499,10 @@ export class BotService {
       delete initialBot.pipeline_status.stage_request
       return this.configProvider.setBotConfig(initialBot.id, initialBot)
     } catch (err) {
-      this.logger.attachError(err).error(`Error trying to "promote_copy" bot : ${initialBot.id}`)
+      this.logger
+        .forBot(newBot.id)
+        .attachError(err)
+        .error(`Error trying to "promote_copy" bot : ${initialBot.id}`)
     }
   }
 
@@ -361,10 +510,21 @@ export class BotService {
   async deleteBot(botId: string) {
     this.stats.track('bot', 'delete')
 
+    if (!(await this.botExists(botId))) {
+      throw new Error(`Bot "${botId}" doesn't exist`)
+    }
+
     await this.unmountBot(botId)
     await this._cleanupRevisions(botId, true)
     await this.ghostService.forBot(botId).deleteFolder('/')
     this._invalidateBotIds()
+  }
+
+  public async getBotTemplate(moduleId: string, templateId: string): Promise<FileContent[]> {
+    const resourceLoader = new ModuleResourceLoader(this.logger, moduleId, this.ghostService)
+    const templatePath = await resourceLoader.getBotTemplatePath(templateId)
+
+    return this._loadBotTemplateFiles(templatePath)
   }
 
   private async _createBotFromTemplate(botConfig: BotConfig, template: BotTemplate): Promise<BotConfig | undefined> {
@@ -380,7 +540,8 @@ export class BotService {
         const mergedConfigs = {
           ...DEFAULT_BOT_CONFIGS,
           ...templateConfig,
-          ...botConfig
+          ...botConfig,
+          version: process.BOTPRESS_VERSION
         }
 
         if (!mergedConfigs.imports.contentTypes) {
@@ -393,7 +554,7 @@ export class BotService {
         }
 
         await scopedGhost.ensureDirs('/', BOT_DIRECTORIES)
-        await scopedGhost.upsertFile('/', BOT_CONFIG_FILENAME, JSON.stringify(mergedConfigs, undefined, 2))
+        await scopedGhost.upsertFile('/', BOT_CONFIG_FILENAME, stringify(mergedConfigs))
         await scopedGhost.upsertFiles('/', files)
 
         return mergedConfigs
@@ -401,7 +562,10 @@ export class BotService {
         throw new Error("Bot template doesn't exist")
       }
     } catch (err) {
-      this.logger.attachError(err).error(`Error creating bot ${botConfig.id} from template "${template.name}"`)
+      this.logger
+        .forBot(botConfig.id)
+        .attachError(err)
+        .error(`Error creating bot ${botConfig.id} from template "${template.name}"`)
     }
   }
 
@@ -417,19 +581,25 @@ export class BotService {
     )
   }
 
-  private _isBotMounted(botId: string): boolean {
+  public isBotMounted(botId: string): boolean {
     return BotService._mountedBots.get(botId) || false
   }
 
   // Do not use directly use the public version instead due to broadcasting
-  private async _localMount(botId: string) {
-    if (this._isBotMounted(botId)) {
-      return
+  private async _localMount(botId: string): Promise<boolean> {
+    const startTime = Date.now()
+    if (this.isBotMounted(botId)) {
+      return true
+    }
+
+    if (!(await this.ghostService.forBot(botId).fileExists('/', 'bot.config.json'))) {
+      this.logger
+        .forBot(botId)
+        .error(`Cannot mount bot "${botId}". Make sure it exists on the filesystem or the database.`)
+      return false
     }
 
     try {
-      await this.ghostService.forBot(botId).sync()
-
       await this.cms.loadElementsForBot(botId)
       await this.moduleLoader.loadModulesForBot(botId)
 
@@ -437,16 +607,45 @@ export class BotService {
       await this.hookService.executeHook(new Hooks.AfterBotMount(api, botId))
       BotService._mountedBots.set(botId, true)
       this._invalidateBotIds()
+
+      if (BotService._botListenerHandles.has(botId)) {
+        BotService._botListenerHandles.get(botId)!.dispose()
+        BotService._botListenerHandles.delete(botId)
+      }
+
+      BotService._botListenerHandles.set(
+        botId,
+        PersistedConsoleLogger.listenForAllLogs((level, message, args) => {
+          this.realtimeService.sendToSocket(
+            RealTimePayload.forAdmins('logs::' + botId, {
+              level,
+              message,
+              args
+            })
+          )
+        }, botId)
+      )
+
+      BotService.setBotStatus(botId, 'healthy')
+      return true
     } catch (err) {
       this.logger
+        .forBot(botId)
         .attachError(err)
-        .error(`Cannot mount bot "${botId}". Make sure it exists on the filesytem or the database.`)
+        .critical(`Cannot mount bot "${botId}"`)
+
+      return false
+    } finally {
+      await this._updateBotHealthDebounce()
+      debug.forBot(botId, `Mount took ${Date.now() - startTime}ms`)
     }
   }
 
   // Do not use directly use the public version instead due to broadcasting
   private async _localUnmount(botId: string) {
-    if (!this._isBotMounted(botId)) {
+    const startTime = Date.now()
+    if (!this.isBotMounted(botId)) {
+      this._invalidateBotIds()
       return
     }
 
@@ -455,8 +654,13 @@ export class BotService {
 
     const api = await createForGlobalHooks()
     await this.hookService.executeHook(new Hooks.AfterBotUnmount(api, botId))
+
     BotService._mountedBots.set(botId, false)
+    BotService.setBotStatus(botId, 'disabled')
+
+    await this._updateBotHealthDebounce()
     this._invalidateBotIds()
+    debug.forBot(botId, `Unmount took ${Date.now() - startTime}ms`)
   }
 
   private _invalidateBotIds(): void {
@@ -471,9 +675,14 @@ export class BotService {
 
   public async listRevisions(botId: string): Promise<string[]> {
     const globalGhost = this.ghostService.global()
+    if (!(await this.botExists(botId))) {
+      throw new Error(`Bot "${botId}" doesn't exist`)
+    }
+
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(botId)
 
     let stageID = ''
-    if (await this.workspaceService.hasPipeline()) {
+    if (await this.workspaceService.hasPipeline(workspaceId)) {
       const botConfig = await this.configProvider.getBotConfig(botId)
       stageID = botConfig.pipeline_status.current_stage.id
     }
@@ -482,29 +691,39 @@ export class BotService {
     return revisions
       .filter(rev => rev.startsWith(`${botId}${REV_SPLIT_CHAR}`) && rev.includes(stageID))
       .sort((revA, revB) => {
-        const dateA = revA.split(REV_SPLIT_CHAR)[1].replace('.tgz', '')
-        const dateB = revB.split(REV_SPLIT_CHAR)[1].replace('.tgz', '')
+        const dateA = revA.split(REV_SPLIT_CHAR)[1].replace(/\.tgz$/i, '')
+        const dateB = revB.split(REV_SPLIT_CHAR)[1].replace(/\.tgz$/i, '')
 
         return parseInt(dateA, 10) - parseInt(dateB, 10)
       })
   }
 
   public async createRevision(botId: string): Promise<void> {
+    if (!(await this.botExists(botId))) {
+      throw new Error(`Bot "${botId}" doesn't exist`)
+    }
+
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(botId)
     let revName = botId + REV_SPLIT_CHAR + Date.now()
 
-    if (await this.workspaceService.hasPipeline()) {
+    if (await this.workspaceService.hasPipeline(workspaceId)) {
       const botConfig = await this.configProvider.getBotConfig(botId)
       revName = revName + REV_SPLIT_CHAR + botConfig.pipeline_status.current_stage.id
     }
 
     const botGhost = this.ghostService.forBot(botId)
     const globalGhost = this.ghostService.global()
-    await globalGhost.upsertFile(REVISIONS_DIR, `${revName}.tgz`, await botGhost.exportToArchiveBuffer('models/*'))
+    await globalGhost.upsertFile(REVISIONS_DIR, `${revName}.tgz`, await botGhost.exportToArchiveBuffer('models/**/*'))
     return this._cleanupRevisions(botId)
   }
 
   public async rollback(botId: string, revision: string): Promise<void> {
-    const revParts = revision.replace('.tgz', '').split(REV_SPLIT_CHAR)
+    if (!(await this.botExists(botId))) {
+      throw new Error(`Bot "${botId}" doesn't exist`)
+    }
+
+    const workspaceId = await this.workspaceService.getBotWorkspaceId(botId)
+    const revParts = revision.replace(/\.tgz$/i, '').split(REV_SPLIT_CHAR)
     if (revParts.length < 2) {
       throw new VError('invalid revision')
     }
@@ -513,7 +732,7 @@ export class BotService {
       throw new VError('cannot rollback a bot with a different Id')
     }
 
-    if (await this.workspaceService.hasPipeline()) {
+    if (await this.workspaceService.hasPipeline(workspaceId)) {
       const botConfig = await this.configProvider.getBotConfig(botId)
       if (revParts.length < 3 || revParts[2] != botConfig.pipeline_status.current_stage.id) {
         throw new VError('cannot rollback a bot to a different stage')
@@ -530,17 +749,74 @@ export class BotService {
       await this.ghostService.forBot(botId).deleteFolder('/')
       await this.ghostService.forBot(botId).importFromDirectory(tmpDir.name)
       await this.mountBot(botId)
-      this.logger.info(`Rollback of bot ${botId} successful`)
+      this.logger.forBot(botId).info(`Rollback of bot ${botId} successful`)
     } finally {
       tmpDir.removeCallback()
     }
   }
 
   private async _cleanupRevisions(botId: string, cleanAll: boolean = false): Promise<void> {
-    const revs = await this.listRevisions(botId)
+    const revs = (await this.listRevisions(botId)).reverse()
     const outDated = revs.filter((_, i) => cleanAll || i > MAX_REV)
 
     const globalGhost = this.ghostService.global()
     await Promise.mapSeries(outDated, rev => globalGhost.deleteFile(REVISIONS_DIR, rev))
+  }
+
+  private async _updateBotHealth(): Promise<void> {
+    const botIds = await this.getBotsIds()
+
+    Object.keys(BotService._botHealth)
+      .filter(x => !botIds.includes(x))
+      .forEach(id => delete BotService._botHealth[id])
+
+    const redis = this.jobService.getRedisClient()
+    if (redis) {
+      const data = JSON.stringify({ serverId: process.SERVER_ID, hostname: os.hostname(), bots: BotService._botHealth })
+      await redis.set(getBotStatusKey(process.SERVER_ID), data, 'PX', STATUS_EXPIRY)
+    }
+  }
+
+  public async getBotHealth(): Promise<ServerHealth[]> {
+    const redis = this.jobService.getRedisClient()
+    if (!redis) {
+      return [{ serverId: process.SERVER_ID, hostname: os.hostname(), bots: BotService._botHealth }]
+    }
+
+    const serverIds = await redis.keys(getBotStatusKey('*'))
+    if (!serverIds.length) {
+      return []
+    }
+
+    const servers = await redis.mget(...serverIds)
+    return Promise.mapSeries(servers, data => JSON.parse(data as string))
+  }
+
+  public static incrementBotStats(botId: string, type: 'error' | 'warning' | 'critical') {
+    if (!this._botHealth[botId]) {
+      this._botHealth[botId] = DEFAULT_BOT_HEALTH
+    }
+
+    if (type === 'error') {
+      this._botHealth[botId].errorCount++
+    } else if (type === 'warning') {
+      this._botHealth[botId].warningCount++
+    } else if (type === 'critical') {
+      this._botHealth[botId].criticalCount++
+      this._botHealth[botId].status = 'unhealthy'
+    }
+  }
+
+  public static setBotStatus(botId: string, status: 'healthy' | 'unhealthy' | 'disabled') {
+    this._botHealth[botId] = {
+      ...(this._botHealth[botId] || DEFAULT_BOT_HEALTH),
+      status
+    }
+
+    if (['disabled'].includes(status)) {
+      this._botHealth[botId].errorCount = 0
+      this._botHealth[botId].warningCount = 0
+      this._botHealth[botId].criticalCount = 0
+    }
   }
 }

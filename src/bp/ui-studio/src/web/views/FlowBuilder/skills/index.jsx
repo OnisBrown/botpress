@@ -1,16 +1,19 @@
 import React from 'react'
-import { Modal, Button } from 'react-bootstrap'
+import { Button } from 'react-bootstrap'
 import axios from 'axios'
 import find from 'lodash/find'
 import includes from 'lodash/includes'
 import Loader from 'react-loaders'
 import withLanguage from '../../../components/Util/withLanguage'
+import { connect } from 'react-redux'
 
+import { cancelNewSkill, insertNewSkill, updateSkill } from '~/actions'
 const style = require('./style.scss')
 
 const VALID_WINDOW_SIZES = ['normal', 'large', 'small']
 
 import InjectedModuleView from '~/components/PluginInjectionSite/module'
+import { lang, Dialog } from 'botpress/shared'
 
 class WrappedInjectedModule extends React.Component {
   shouldComponentUpdate(nextProps) {
@@ -33,17 +36,13 @@ class SkillsBuilder extends React.Component {
   state = this.resetState()
 
   componentDidMount() {
-    this.setState({ initialData: this.props.data })
-  }
-
-  componentDidMount() {
     this.setState({
       ...this.resetState(),
       moduleProps: this.buildModuleProps(this.props.data)
     })
   }
 
-  componentWillReceiveProps(nextProps) {
+  UNSAFE_componentWillReceiveProps(nextProps) {
     if (nextProps.skillId !== this.props.skillId || nextProps.opened !== this.props.opened) {
       this.setState({
         ...this.resetState(),
@@ -53,7 +52,7 @@ class SkillsBuilder extends React.Component {
   }
 
   renderModuleNotFound = () => {
-    return <div>Could not load skill&apos;s view</div>
+    return <div>{lang.tr('studio.flow.skills.couldNotLoad')}</div>
   }
 
   onDataChanged = data => {
@@ -81,7 +80,8 @@ class SkillsBuilder extends React.Component {
           skillId: this.props.skillId,
           data: this.data,
           generatedFlow: generated.flow,
-          transitions: generated.transitions
+          transitions: generated.transitions,
+          location: this.props.location
         })
       }
     })
@@ -102,7 +102,7 @@ class SkillsBuilder extends React.Component {
 
     return (
       <div className={style.loadingContainer}>
-        <h2>Generating your skill flow...</h2>
+        <h2>{lang.tr('studio.flow.skills.generatingSkillFlow')}</h2>
         <Loader type="ball-pulse" color="#26A65B" style={{ margin: '4px' }} />
       </div>
     )
@@ -111,7 +111,12 @@ class SkillsBuilder extends React.Component {
   onWindowResized = size => {
     if (!includes(VALID_WINDOW_SIZES, size)) {
       const sizes = VALID_WINDOW_SIZES.join(', ')
-      return console.log(`ERROR – Skill "${size}" is an invalid size for Skill window. Valid sizes are ${sizes}.`)
+      return console.log(
+        lang.tr('studio.flow.skills.error', {
+          size,
+          sizes
+        })
+      )
     }
 
     this.setState({
@@ -152,20 +157,19 @@ class SkillsBuilder extends React.Component {
   render() {
     const skill = this.findInstalledSkill()
     const modalClassName = style['size-' + this.state.windowSize]
-    const submitName = this.props.action === 'new' ? 'Insert' : 'Save'
+    const submitName = this.props.action === 'new' ? lang.tr('insert') : lang.tr('save')
+    const title =
+      this.props.action === 'new' ? lang.tr('studio.flow.skills.insert') : lang.tr('studio.flow.skills.edit')
 
     return (
-      <Modal
-        dialogClassName={modalClassName}
-        animation={false}
-        show={this.props.opened}
-        onHide={this.onCancel}
-        backdrop="static"
+      <Dialog.Wrapper
+        title={`${title} | ${lang.tr(skill && skill.name)}`}
+        size="lg"
+        className={modalClassName}
+        isOpen={this.props.opened}
+        onClose={this.onCancel}
       >
-        <Modal.Header closeButton>
-          <Modal.Title>Insert a new skill | {skill && skill.name}</Modal.Title>
-        </Modal.Header>
-        <Modal.Body>
+        <Dialog.Body>
           {this.renderLoading()}
           {!this.state.loading && (
             <WrappedInjectedModule
@@ -175,16 +179,27 @@ class SkillsBuilder extends React.Component {
               extraProps={this.state.moduleProps}
             />
           )}
-        </Modal.Body>
-        <Modal.Footer>
-          <Button onClick={this.onCancel}>Cancel</Button>
+        </Dialog.Body>
+        <Dialog.Footer>
+          <Button onClick={this.onCancel}>{lang.tr('cancel')}</Button>
           <Button onClick={this.onSubmit} disabled={!this.state.canSubmit} bsStyle="primary">
             {submitName}
           </Button>
-        </Modal.Footer>
-      </Modal>
+        </Dialog.Footer>
+      </Dialog.Wrapper>
     )
   }
 }
 
-export default withLanguage(SkillsBuilder)
+const mapStateToProps = state => ({
+  installedSkills: state.skills.installed,
+  ...state.skills.builder
+})
+
+const mapDispatchToProps = {
+  cancelNewSkill,
+  insertNewSkill,
+  updateSkill
+}
+
+export default connect(mapStateToProps, mapDispatchToProps)(withLanguage(SkillsBuilder))

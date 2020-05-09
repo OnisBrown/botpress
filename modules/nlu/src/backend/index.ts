@@ -1,47 +1,56 @@
 import 'bluebird-global'
 import * as sdk from 'botpress/sdk'
+import _ from 'lodash'
 
-import { Config } from '../config'
+import en from '../translations/en.json'
+import fr from '../translations/fr.json'
 
-import api from './api'
-import { registerMiddleware } from './middleware'
+import dialogConditions from './dialog-conditions'
+import EntityService from './entities/entities-service'
+import { getIntents, updateIntent } from './intents/intent-service'
+import { getOnBotMount } from './module-lifecycle/on-bot-mount'
+import { getOnBotUnmount } from './module-lifecycle/on-bot-unmount'
+import { getOnServerReady } from './module-lifecycle/on-server-ready'
+import { getOnSeverStarted } from './module-lifecycle/on-server-started'
+import { NLUState } from './typings'
 
-import ConfusionEngine from './confusion-engine'
-import models from './models'
-import { DucklingEntityExtractor } from './pipelines/entities/duckling_extractor'
-import Storage from './storage'
-import { EngineByBot } from './typings'
+const state: NLUState = { nluByBot: {} }
 
-const nluByBot: EngineByBot = {}
-
-const onServerStarted = async (bp: typeof sdk) => {
-  Storage.ghostProvider = (botId?: string) => (botId ? bp.ghost.forBot(botId) : bp.ghost.forGlobal())
-
-  const globalConfig = (await bp.config.getModuleConfig('nlu')) as Config
-  await DucklingEntityExtractor.configure(globalConfig.ducklingEnabled, globalConfig.ducklingURL, bp.logger)
-
-  await registerMiddleware(bp, nluByBot)
-}
-
-const onServerReady = async (bp: typeof sdk) => {
-  await api(bp, nluByBot)
-  await models(bp)
-}
-
-const onBotMount = async (bp: typeof sdk, botId: string) => {
-  const moduleBotConfig = (await bp.config.getModuleConfigForBot('nlu', botId)) as Config
-  const scoped = new ConfusionEngine(bp.logger, botId, moduleBotConfig, bp.MLToolkit)
-  await scoped.init()
-  nluByBot[botId] = scoped
-}
-
-const onBotUnmount = async (bp: typeof sdk, botId: string) => {
-  delete nluByBot[botId]
-}
-
+const onServerStarted = getOnSeverStarted(state)
+const onServerReady = getOnServerReady(state)
+const onBotMount = getOnBotMount(state)
+const onBotUnmount = getOnBotUnmount(state)
 const onModuleUnmount = async (bp: typeof sdk) => {
   bp.events.removeMiddleware('nlu.incoming')
   bp.http.deleteRouterForBot('nlu')
+  // if module gets deactivated but server keeps running, we want to destroy bot state
+  Object.keys(state.nluByBot).forEach(botID => () => onBotUnmount(bp, botID))
+}
+
+const onTopicChanged = async (bp: typeof sdk, botId: string, oldName?: string, newName?: string) => {
+  const isRenaming = !!(oldName && newName)
+  const isDeleting = !newName
+
+  if (!isRenaming && !isDeleting) {
+    return
+  }
+
+  const ghost = bp.ghost.forBot(botId)
+  const entityService = new EntityService(ghost, botId)
+  const intentDefs = await getIntents(ghost)
+
+  for (const intentDef of intentDefs) {
+    const ctxIdx = intentDef.contexts.indexOf(oldName)
+    if (ctxIdx !== -1) {
+      intentDef.contexts.splice(ctxIdx, 1)
+
+      if (isRenaming) {
+        intentDef.contexts.push(newName)
+      }
+
+      await updateIntent(ghost, intentDef.name, intentDef, entityService)
+    }
+  }
 }
 
 const entryPoint: sdk.ModuleEntryPoint = {
@@ -50,15 +59,18 @@ const entryPoint: sdk.ModuleEntryPoint = {
   onBotMount,
   onBotUnmount,
   onModuleUnmount,
+  dialogConditions,
+  onTopicChanged,
+  translations: { en, fr },
   definition: {
     name: 'nlu',
     moduleView: {
       stretched: true
     },
-    menuIcon: 'fiber_smart_record',
+    menuIcon: 'translate',
     menuText: 'NLU',
     fullName: 'NLU',
-    homepage: 'https://botpress.io'
+    homepage: 'https://botpress.com'
   }
 }
 

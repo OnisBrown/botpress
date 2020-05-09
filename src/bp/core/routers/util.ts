@@ -1,13 +1,13 @@
-import { Logger } from 'botpress/sdk'
+import { Logger, StrategyUser } from 'botpress/sdk'
 import { checkRule } from 'common/auth'
+import { InvalidOperationError } from 'core/services/auth/errors'
 import { WorkspaceService } from 'core/services/workspace-service'
 import { NextFunction, Request, Response } from 'express'
 import Joi from 'joi'
 import onHeaders from 'on-headers'
 
-import { AuthUser, RequestWithUser, TokenUser } from '../misc/interfaces'
-import { SERVER_USER } from '../server'
-import AuthService from '../services/auth/auth-service'
+import { RequestWithUser, TokenUser } from '../../common/typings'
+import AuthService, { SERVER_USER, WORKSPACE_HEADER } from '../services/auth/auth-service'
 import { incrementMetric } from '../services/monitoring'
 
 import {
@@ -24,10 +24,13 @@ const debugSuccess = DEBUG('audit:collab:success')
 const debugSuperSuccess = DEBUG('audit:admin:success')
 const debugSuperFailure = DEBUG('audit:admin:fail')
 
+// TODO: Remove BPRequest, AsyncMiddleware and asyncMiddleware from this file
+
 export type BPRequest = Request & {
-  authUser: AuthUser | undefined
+  authUser: StrategyUser | undefined
   tokenUser: TokenUser | undefined
   credentials: any | undefined
+  workspace?: string
 }
 
 export type AsyncMiddleware = (
@@ -36,6 +39,13 @@ export type AsyncMiddleware = (
 
 export const asyncMiddleware = (logger: Logger, routerName: string): AsyncMiddleware => fn => (req, res, next) => {
   Promise.resolve(fn(req as BPRequest, res, next)).catch(err => {
+    if (typeof err === 'string') {
+      err = {
+        skipLogging: false,
+        message: err
+      }
+    }
+
     err.router = routerName
     if (!err.skipLogging && !process.IS_PRODUCTION) {
       logger.attachError(err).debug(`[${routerName}] Async request error ${err.message}`)
@@ -70,11 +80,11 @@ export const validateRequestSchema = (property: string, req: Request, schema: Jo
 
 export const validateBodySchema = (req: Request, schema: Joi.AnySchema) => validateRequestSchema('body', req, schema)
 
-export const success = (res: Response, message: string = 'Success', payload = {}) => {
+export const success = <T extends {}>(res: Response, message: string = 'Success', payload?: T) => {
   res.json({
     status: 'success',
     message,
-    payload
+    payload: payload || {}
   })
 }
 
@@ -104,6 +114,7 @@ export const checkTokenHeader = (authService: AuthService, audience?: string) =>
     }
 
     req.tokenUser = tokenUser
+    req.workspace = req.headers[WORKSPACE_HEADER] as string
   } catch (err) {
     return next(new UnauthorizedError('Invalid authentication token'))
   }
@@ -118,7 +129,7 @@ export const loadUser = (authService: AuthService) => async (req: Request, res: 
     return next(new InternalServerError('No tokenUser in request'))
   }
 
-  const authUser = await authService.findUserByEmail(tokenUser.email)
+  const authUser = await authService.findUser(tokenUser.email, tokenUser.strategy)
   if (!authUser) {
     return next(new UnauthorizedError('Unknown user'))
   }
@@ -156,15 +167,21 @@ export const assertSuperAdmin = (req: Request, res: Response, next: Function) =>
   next()
 }
 
+export const assertWorkspace = async (req: RequestWithUser, _res: Response, next: NextFunction) => {
+  if (!req.workspace) {
+    return next(new InvalidOperationError(`Workspace is missing. Set header X-BP-Workspace`))
+  }
+  next()
+}
+
 export const assertBotpressPro = (workspaceService: WorkspaceService) => async (
   _req: RequestWithUser,
   _res: Response,
   next: NextFunction
 ) => {
   if (!process.IS_PRO_ENABLED || !process.IS_LICENSED) {
-    const workspace = await workspaceService.getWorkspace()
     // Allow to create the first user
-    if (workspace.users.length > 0) {
+    if ((await workspaceService.getUniqueCollaborators()) > 0) {
       return next(new PaymentRequiredError('Botpress Pro is required to perform this action'))
     }
   }
@@ -172,54 +189,113 @@ export const assertBotpressPro = (workspaceService: WorkspaceService) => async (
   return next()
 }
 
+/**
+ * This method checks if the user exists, if he has access to the requested workspace, and if his role
+ * allows him to do the requested operation. No other security checks should be needed.
+ */
 export const needPermissions = (workspaceService: WorkspaceService) => (operation: string, resource: string) => async (
   req: RequestWithUser,
   _res: Response,
   next: NextFunction
 ) => {
-  const email = req.tokenUser && req.tokenUser!.email
-  // The server user is used internally, and has all the permissions
-  if (email === SERVER_USER) {
-    return next()
+  const err = await checkPermissions(workspaceService)(operation, resource)(req)
+  return next(err)
+}
+
+/**
+ * This method checks if the user has read access if method is get, and write access otherwise
+ */
+export const checkMethodPermissions = (workspaceService: WorkspaceService) => (resource: string) => async (
+  req: RequestWithUser,
+  _res: Response,
+  next: NextFunction
+) => {
+  const method = req.method.toLowerCase()
+  const operation = method === 'get' || method === 'options' ? 'read' : 'write'
+  const err = await checkPermissions(workspaceService)(operation, resource)(req)
+  return next(err)
+}
+
+/**
+ * Just like needPermissions but returns a boolean and can be used inside an express middleware
+ */
+export const hasPermissions = (workspaceService: WorkspaceService) => async (
+  req: RequestWithUser,
+  operation: string,
+  resource: string,
+  noAudit?: boolean
+) => {
+  const err = await checkPermissions(workspaceService)(operation, resource, noAudit)(req)
+  return !err
+}
+
+const checkPermissions = (workspaceService: WorkspaceService) => (
+  operation: string,
+  resource: string,
+  noAudit?: boolean
+) => async (req: RequestWithUser) => {
+  const audit = (debugMethod: Function, args?: any) => {
+    if (noAudit) {
+      return
+    }
+
+    debugMethod(`${req.originalUrl} %o`, {
+      method: req.method,
+      email: req.tokenUser?.email,
+      operation,
+      resource,
+      ip: req.ip,
+      ...args
+    })
   }
 
-  const user = await workspaceService.findUser({ email })
+  if (!req.tokenUser) {
+    audit(debugFailure, { email: 'n/a', reason: 'unauthenticated' })
+    return new ForbiddenError(`Unauthorized`)
+  }
+
+  if (!req.workspace && req.params.botId) {
+    req.workspace = await workspaceService.getBotWorkspaceId(req.params.botId)
+  }
+
+  if (!req.workspace) {
+    throw new InvalidOperationError(`Workspace is missing. Set header X-BP-Workspace`)
+  }
+
+  const { email, strategy, isSuperAdmin } = req.tokenUser
+
+  // The server user is used internally, and has all the permissions
+  if (email === SERVER_USER || isSuperAdmin) {
+    audit(debugSuccess, { userRole: 'superAdmin' })
+    return
+  }
+
+  if (!email || !strategy) {
+    audit(debugFailure, { reason: 'missing auth parameter' })
+    return new NotFoundError(`Missing one of the required parameters: email or strategy`)
+  }
+
+  const user = await workspaceService.findUser(email, strategy, req.workspace)
 
   if (!user) {
-    debugFailure(`${req.originalUrl} %o`, {
-      method: req.method,
-      email,
-      operation,
-      resource,
-      ip: req.ip
-    })
-    return next(new NotFoundError(`User "${email}" does not exists`))
+    audit(debugFailure, { reason: 'missing workspace access' })
+    return new ForbiddenError(`User "${email}" doesn't have access to workspace "${req.workspace}"`)
   }
 
-  const role = await workspaceService.getRoleForUser(req.tokenUser!.email)
+  const role = await workspaceService.getRoleForUser(email, strategy, req.workspace)
 
   if (!role || !checkRule(role.rules, operation, resource)) {
-    debugFailure(req.originalUrl, {
-      method: req.method,
-      email,
-      operation,
-      resource,
-      userRole: role && role.id,
-      ip: req.ip
-    })
-    return next(
-      new ForbiddenError(`user does not have sufficient permissions to "${operation}" on ressource "${resource}"`)
-    )
+    audit(debugFailure, { userRole: role?.id, reason: 'lack sufficient permissions' })
+    return new ForbiddenError(`user does not have sufficient permissions to "${operation}" on resource "${resource}"`)
   }
 
-  debugSuccess(`${req.originalUrl} %o`, {
-    method: req.method,
-    email,
-    operation,
-    resource,
-    userRole: role && role.id,
-    ip: req.ip
-  })
+  audit(debugSuccess, { userRole: role?.id })
+}
 
-  next()
+export interface TypedRequest<T> extends Request {
+  body: T
+}
+
+export interface TypedResponse<T> extends Response {
+  send: (body: T) => TypedResponse<T>
 }

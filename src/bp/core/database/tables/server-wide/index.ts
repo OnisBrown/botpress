@@ -1,4 +1,5 @@
 export * from './channel_users'
 export * from './metadata'
-export * from './migrations'
 export * from './data_retention'
+export * from './workspace_users'
+export * from './workspace_invite_codes'

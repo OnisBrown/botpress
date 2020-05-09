@@ -5,8 +5,11 @@ import _ from 'lodash'
 import { Memoize } from 'lodash-decorators'
 import path from 'path'
 import { VError } from 'verror'
+import yn from 'yn'
 
 import { GhostService } from '../'
+
+const debug = DEBUG('configuration').sub('modules')
 
 type Config = { [key: string]: any }
 
@@ -14,7 +17,7 @@ type Config = { [key: string]: any }
  * Load configuration for a specific module in the following precedence order:
  * 1) Default Value (Least precedence)
  * 2) Global Value Override
- * 3) Environement Variable Override
+ * 3) Environment Variable Override
  * 4) Per-bot Override (Most precedence)
  */
 export default class ConfigReader {
@@ -75,12 +78,48 @@ export default class ConfigReader {
   private async loadFromEnvVariables(moduleId: string) {
     const schema = await this.getModuleConfigSchema(moduleId)
     const config = {}
+    const debugConfig = debug.sub(moduleId)
 
-    for (const option of _.keys(schema.properties)) {
-      const key = `BP_${moduleId}_${option}`.toUpperCase()
+    /* START DEPRECATED */
+    // TODO: Remove support for those old env variables in BP 12 (we need to add those to 11 -> 12 migration guide)
+    for (const option of Object.keys(schema.properties)) {
+      const keyOld = `BP_${moduleId}_${option}`.toUpperCase()
+      if (keyOld in process.env) {
+        debugConfig('(deprecated) setting env variable', { variable: option, env: keyOld, module: moduleId })
+        config[option] = process.env[keyOld]
+      }
+    } /* END DEPRECATED */
 
-      if (key in process.env) {
-        config[option] = process.env[key]
+    const getPropertiesRecursive = (obj: any, path: string = ''): string[] => {
+      if (obj && obj.type === 'object' && obj.properties) {
+        return _.chain(Object.keys(obj.properties))
+          .filter(x => !x.startsWith('$'))
+          .map(key => getPropertiesRecursive(obj.properties[key], path.length ? path + '.' + key : key))
+          .flatten()
+          .value()
+      }
+
+      return [path]
+    }
+
+    const getValue = (key: string) => {
+      try {
+        return JSON.parse(process.env[key]!)
+      } catch (err) {
+        return process.env[key]
+      }
+    }
+
+    for (const option of getPropertiesRecursive(schema)) {
+      const envOption = `${moduleId}_${option}`.replace(/[^A-Z0-9_]+/gi, '_')
+      const envKey = `BP_MODULE_${envOption}`.toUpperCase()
+      if (envKey in process.env) {
+        // Using .set because it supports set on a path with dots
+        const value = getValue(envKey)
+        _.set(config, option, value)
+        debugConfig('ENV SET', { variable: option, env: envKey, value })
+      } else {
+        debugConfig('ENV NOT SET', { variable: option, env: envKey })
       }
     }
 
@@ -91,7 +130,7 @@ export default class ConfigReader {
   private async getModuleDefaultConfigFile(moduleId): Promise<any | undefined> {
     try {
       const defaultConfig = {
-        $schema: `../../../assets/modules/${moduleId}/config.schema.json`,
+        $schema: `../../assets/modules/${moduleId}/config.schema.json`,
         ...defaultJsonBuilder(await this.getModuleConfigSchema(moduleId))
       }
 
@@ -121,18 +160,26 @@ export default class ConfigReader {
    */
   private async bootstrapGlobalConfigurationFiles() {
     for (const moduleId of this.modules.keys()) {
-      if (await this.isGlobalConfigurationFileMissing(moduleId)) {
-        const config = await this.getModuleDefaultConfigFile(moduleId)
-        const fileName = `${moduleId}.json`
-        await this.ghost.global().upsertFile('config', fileName, config)
-        this.logger.debug(`Added missing "${fileName}" configuration file`)
-      }
+      await this.loadModuleGlobalConfigFile(moduleId)
     }
   }
 
-  private async getMerged(moduleId: string, botId?: string): Promise<Config> {
+  public async loadModuleGlobalConfigFile(moduleId: string) {
+    if (await this.isGlobalConfigurationFileMissing(moduleId)) {
+      const config = await this.getModuleDefaultConfigFile(moduleId)
+      const fileName = `${moduleId}.json`
+      await this.ghost.global().upsertFile('config', fileName, config)
+      this.logger.debug(`Added missing "${fileName}" configuration file`)
+    }
+  }
+
+  private async getMerged(moduleId: string, botId?: string, ignoreGlobal?: boolean): Promise<Config> {
     let config = await this.loadFromDefaultValues(moduleId)
-    config = { ...config, ...(await this.loadFromGlobalConfigFile(moduleId)) }
+
+    if (!ignoreGlobal) {
+      config = { ...config, ...(await this.loadFromGlobalConfigFile(moduleId)) }
+    }
+
     config = { ...config, ...(await this.loadFromEnvVariables(moduleId)) }
     if (botId) {
       config = { ...config, ...(await this.loadFromBotConfigFile(moduleId, botId)) }
@@ -148,7 +195,14 @@ export default class ConfigReader {
 
   // Don't @Memoize() this fn. It only memoizes on the first argument
   // https://github.com/steelsojka/lodash-decorators/blob/master/src/memoize.ts#L15
-  public getForBot(moduleId: string, botId: string): Promise<Config> {
-    return this.getMerged(moduleId, botId)
+  public getForBot(moduleId: string, botId: string, ignoreGlobal?: boolean): Promise<Config> {
+    const cacheKey = `${moduleId}//${botId}//${!!ignoreGlobal}`
+    return this.getForBotMemoized(cacheKey)
+  }
+
+  @Memoize()
+  public getForBotMemoized(cacheKey: string): Promise<Config> {
+    const [moduleId, botId, ignoreGlobal] = cacheKey.split('//')
+    return this.getMerged(moduleId, botId, yn(ignoreGlobal))
   }
 }

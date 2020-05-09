@@ -46,6 +46,9 @@ metadata.json
 edition.json
 /pro
 
+build/tests/e2e/screenshots/*
+!build/tests/e2e/screenshots/.gitkeep
+
 # Botpress docs
 /docs/reference/public
 /docs/guide/build
@@ -55,3 +58,6 @@ edition.json
 /internal-modules
 /private-modules
 /src/bp/ml/node-svm
+
+# tests output
+cache

@@ -26,49 +26,49 @@ createDatabaseSuite('KVS', (database: Database) => {
 
   beforeEach(async () => {
     try {
-      await kvs.set(BOTID, KEY, defaultValue)
+      await kvs.forBot(BOTID).set(KEY, defaultValue)
     } catch (err) {}
   })
 
   describe('Get', () => {
-    it('Returns undefined if key doesnt exists', async () => {
-      const value = await kvs.get(BOTID, 'does-not-exist')
+    it("Returns undefined if key doesn't exist", async () => {
+      const value = await kvs.forBot(BOTID).get('does-not-exist')
       expect(value).toBeUndefined()
     })
 
     it('Returns value if key exists', async () => {
-      const value = await kvs.get(BOTID, KEY)
+      const value = await kvs.forBot(BOTID).get(KEY)
       expect(value).toEqual(defaultValue)
     })
 
     it('Returns value at path if key exists', async () => {
-      const value = await kvs.get(BOTID, KEY, 'profile.firstName')
+      const value = await kvs.forBot(BOTID).get(KEY, 'profile.firstName')
       expect(value).toEqual('Bob')
     })
   })
 
   describe('Set', () => {
-    it('Sets value if key doesnt exists', async () => {
+    it("Sets value if key doesn't exist", async () => {
       const key = 'otherKey'
       const expected = 'value'
-      await kvs.set(BOTID, key, expected)
+      await kvs.forBot(BOTID).set(key, expected)
 
-      const value = await kvs.get(BOTID, key)
+      const value = await kvs.forBot(BOTID).get(key)
       expect(expected).toEqual(value)
     })
 
     it('Overwrite existing keys', async () => {
       const expected = 'new value'
-      await kvs.set(BOTID, KEY, expected)
+      await kvs.forBot(BOTID).set(KEY, expected)
 
-      const value = await kvs.get(BOTID, KEY)
+      const value = await kvs.forBot(BOTID).get(KEY)
       expect(value).toEqual(expected)
     })
 
     it('Overwrite existing keys at path but keep existing values', async () => {
-      await kvs.set(BOTID, KEY, {}, 'profile')
+      await kvs.forBot(BOTID).set(KEY, {}, 'profile')
 
-      const value = await kvs.get(BOTID, KEY)
+      const value = await kvs.forBot(BOTID).get(KEY)
       expect(value.profile).toEqual({})
       expect(value.stats).toEqual({
         awesomeness: 'Chuck Norris Level'
@@ -77,15 +77,36 @@ createDatabaseSuite('KVS', (database: Database) => {
 
     it('Deep overwrite', async () => {
       const newValue = 'The Great Bob'
-      await kvs.set(BOTID, KEY, newValue, 'profile.firstName')
+      await kvs.forBot(BOTID).set(KEY, newValue, 'profile.firstName')
 
-      const value = await kvs.get(BOTID, KEY)
+      const value = await kvs.forBot(BOTID).get(KEY)
       expect(value.profile.firstName).toEqual(newValue)
       expect(value.profile.lastName).toEqual('Ross')
       expect(value.profile.address).toEqual({
         street: '123 Awesome Street',
         city: 'Awesome City'
       })
+    })
+  })
+
+  describe('global/scoped', () => {
+    test('kvs entries of global and scoped should not interfer', async () => {
+      // Arrange && Act
+      const key = 'gordon-ramsay-favorite-number'
+      await kvs.forBot('bot1').set(key, '1')
+      await kvs.global().set(key, '2')
+      await kvs.forBot('bot1').set(key, '666')
+      await kvs.forBot('bot2').set(key, '69')
+      await kvs.global().set(key, '42')
+
+      const globalActual = await kvs.global().get(key)
+      const bot1Actual = await kvs.forBot('bot1').get(key)
+      const bot2actual = await kvs.forBot('bot2').get(key)
+
+      // Assert
+      expect(globalActual).toEqual('42')
+      expect(bot1Actual).toEqual('666')
+      expect(bot2actual).toEqual('69')
     })
   })
 })

@@ -1,7 +1,6 @@
 {
+  "extends": "../tsconfig.shared.json",
   "compilerOptions": {
-    "esModuleInterop": true,
-    "lib": ["es7"],
-    "typeRoots": ["./src/botpress.d.ts", "./src/global.d.ts", "./node_modules/@types", "./src/backend/typings.d.ts"]
+    "baseUrl": "./"
   }
 }

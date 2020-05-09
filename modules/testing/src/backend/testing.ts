@@ -6,6 +6,7 @@ import path from 'path'
 import { Recorder } from './recorder'
 import { SenarioRunner } from './runner'
 import { Scenario } from './typings'
+import { buildScenarioFromEvents } from './utils'
 
 const SCENARIO_FOLDER = 'scenarios'
 
@@ -64,6 +65,18 @@ export class Testing {
     this._runner.processCompleted(event)
   }
 
+  async buildScenario(eventIds: string[]) {
+    const events = await this._findEvents(eventIds)
+
+    if (events.length !== eventIds.length) {
+      throw new Error(
+        `Could not load some specified events. Expected ${eventIds.length}, got ${events.length} events. Maybe they were cleared from the database, or they weren't saved yet.`
+      )
+    }
+
+    return buildScenarioFromEvents(events)
+  }
+
   async saveScenario(name, scenario) {
     await this.bp.ghost
       .forBot(this.botId)
@@ -88,7 +101,7 @@ export class Testing {
     this._runner.startReplay()
 
     // TODO perform scenario validation here
-    const scenario = await this.bp.ghost
+    const scenario: Scenario = await this.bp.ghost
       .forBot(this.botId)
       .readFileAsObject(SCENARIO_FOLDER, liteScenario.name + '.json')
 
@@ -137,5 +150,18 @@ export class Testing {
     })
 
     return this._scenarios
+  }
+
+  private async _findEvents(eventIds: string[]): Promise<sdk.IO.StoredEvent[]> {
+    return this.bp
+      .database('events')
+      .whereIn('incomingEventId', eventIds)
+      .andWhere({ direction: 'incoming' })
+      .then(rows =>
+        rows.map(storedEvent => ({
+          ...storedEvent,
+          event: this.bp.database.json.get(storedEvent.event)
+        }))
+      )
   }
 }

@@ -1,35 +1,27 @@
 import * as sdk from 'botpress/sdk'
 import _ from 'lodash'
 
-import { NLU_PREFIX } from './providers/nlu'
-import NluStorage from './providers/nlu'
-import MicrosoftQnaMakerStorage from './providers/qnaMaker'
-import { QnaStorage } from './qna'
+import { QnaEntry, ScopedBots } from './qna'
+import NluStorage from './storage'
+import { getQnaEntryPayloads, getQuestionForIntent } from './utils'
 
-export const initBot = async (bp: typeof sdk, botScopedStorage: Map<string, QnaStorage>, botId: string) => {
+export const initBot = async (bp: typeof sdk, botId: string, bots: ScopedBots) => {
   const config = await bp.config.getModuleConfigForBot('qna', botId)
+  const defaultLang = (await bp.bots.getBotById(botId)).defaultLanguage
 
-  let storage = undefined
-  if (config.qnaMakerApiKey) {
-    storage = new MicrosoftQnaMakerStorage(bp, config)
-  } else {
-    storage = new NluStorage(bp, config, botId)
-  }
-
+  const storage = new NluStorage(bp, config, botId)
   await storage.initialize()
-  botScopedStorage.set(botId, storage)
+
+  bots[botId] = { storage, config, defaultLang }
 }
 
-export const initModule = async (bp: typeof sdk, botScopedStorage: Map<string, QnaStorage>) => {
+export const initModule = async (bp: typeof sdk, bots: ScopedBots) => {
   bp.events.registerMiddleware({
     name: 'qna.incoming',
     direction: 'incoming',
     handler: async (event: sdk.IO.IncomingEvent, next) => {
       if (!event.hasFlag(bp.IO.WellKnownFlags.SKIP_QNA_PROCESSING)) {
-        const config = await bp.config.getModuleConfigForBot('qna', event.botId)
-        const storage = botScopedStorage.get(event.botId)
-
-        await processEvent(event, { bp, storage, config })
+        await processEvent(event, bots[event.botId])
         next()
       }
     },
@@ -37,35 +29,22 @@ export const initModule = async (bp: typeof sdk, botScopedStorage: Map<string, Q
     description: 'Listen for predefined questions and send canned responses.'
   })
 
-  const getAlternativeAnswer = question => {
-    const randomIndex = Math.floor(Math.random() * question.answers.length)
-    return question.answers[randomIndex]
-  }
-
-  const buildSuggestions = async (event, question, confidence, intent, renderer): Promise<sdk.IO.Suggestion> => {
+  const buildSuggestions = async (
+    event: sdk.IO.IncomingEvent,
+    qnaEntry: QnaEntry,
+    confidence,
+    intent,
+    renderer,
+    defaultLang
+  ): Promise<sdk.IO.Suggestion> => {
     const payloads = []
 
-    if (question.action.includes('text')) {
-      const args = {
-        user: _.get(event, 'state.user') || {},
-        session: _.get(event, 'state.session') || {},
-        temp: _.get(event, 'state.temp') || {},
-        text: getAlternativeAnswer(question),
-        typing: true
-      }
-
-      const element = await bp.cms.renderElement(renderer, args, {
-        botId: event.botId,
-        channel: event.channel,
-        target: event.target,
-        threadId: event.threadId
-      })
-
-      payloads.push(...element)
+    if (qnaEntry.action.includes('text')) {
+      payloads.push(...(await getQnaEntryPayloads(qnaEntry, event, renderer, defaultLang, bp)))
     }
 
-    if (question.action.includes('redirect')) {
-      payloads.push({ type: 'redirect', flow: question.redirectFlow, node: question.redirectNode })
+    if (qnaEntry.action.includes('redirect')) {
+      payloads.push({ type: 'redirect', flow: qnaEntry.redirectFlow, node: qnaEntry.redirectNode })
     }
 
     return <sdk.IO.Suggestion>{
@@ -76,35 +55,16 @@ export const initModule = async (bp: typeof sdk, botScopedStorage: Map<string, Q
     }
   }
 
-  const getQuestionForIntent = async (storage, intentName) => {
-    if (intentName && intentName.startsWith(NLU_PREFIX)) {
-      const qnaId = intentName.substring(NLU_PREFIX.length)
-      return (await storage.getQuestion(qnaId)).data
-    }
-  }
-
-  const processEvent = async (event: sdk.IO.IncomingEvent, { bp, storage, config }) => {
-    if (config.qnaMakerApiKey) {
-      const qnaQuestion = (await storage.answersOn(event.preview)).pop()
-
-      if (qnaQuestion && qnaQuestion.enabled) {
-        event.suggestions.push(
-          await buildSuggestions(event, qnaQuestion, qnaQuestion.confidence, undefined, config.textRenderer)
-        )
-      }
-
-      return
-    }
-
-    if (!event.nlu || !event.nlu.intents) {
+  const processEvent = async (event: sdk.IO.IncomingEvent, { storage, config, defaultLang }) => {
+    if (!event.nlu || !event.nlu.intents || event.ndu) {
       return
     }
 
     for (const intent of event.nlu.intents) {
-      const question = await getQuestionForIntent(storage, intent.name)
-      if (question && question.enabled) {
+      const qnaEntry = await getQuestionForIntent(storage, intent.name)
+      if (qnaEntry && qnaEntry.enabled) {
         event.suggestions.push(
-          await buildSuggestions(event, question, intent.confidence, intent.name, config.textRenderer)
+          await buildSuggestions(event, qnaEntry, intent.confidence, intent.name, config.textRenderer, defaultLang)
         )
       }
     }
